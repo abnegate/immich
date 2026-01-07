@@ -31,7 +31,7 @@ export class TusController {
     return this.service.handleTusUpload(auth, req, res);
   }
 
-  @All(':id')
+  @All('*')
   @Authenticated({ permission: Permission.AssetUpload })
   @Endpoint({
     summary: 'Handle TUS upload request with ID',
