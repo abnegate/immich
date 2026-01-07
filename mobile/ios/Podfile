@@ -32,6 +32,9 @@ target 'Runner' do
   use_modular_headers!
 
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+
+  # TUS resumable upload client
+  pod 'TUSKit', '~> 3.4'
   
   # share_handler addition start
   target 'ShareExtension' do

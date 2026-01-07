@@ -55,6 +55,7 @@ import UIKit
     NativeSyncApiImpl.register(with: engine.registrar(forPlugin: NativeSyncApiImpl.name)!)
     ThumbnailApiSetup.setUp(binaryMessenger: engine.binaryMessenger, api: ThumbnailApiImpl())
     BackgroundWorkerFgHostApiSetup.setUp(binaryMessenger: engine.binaryMessenger, api: BackgroundWorkerApiImpl())
+    TusUploadApiImpl.register(with: engine.registrar(forPlugin: TusUploadApiImpl.name)!)
   }
   
   public static func cancelPlugins(with engine: FlutterEngine) {
