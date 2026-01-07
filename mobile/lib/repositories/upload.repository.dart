@@ -7,6 +7,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/constants/constants.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
+import 'package:immich_mobile/repositories/native_tus_upload.repository.dart';
 import 'package:logging/logging.dart';
 import 'package:immich_mobile/utils/debug_print.dart';
 
@@ -17,13 +18,17 @@ class UploadTaskWithFile {
   const UploadTaskWithFile({required this.file, required this.task});
 }
 
-final uploadRepositoryProvider = Provider((ref) => UploadRepository());
+final uploadRepositoryProvider = Provider((ref) {
+  final nativeTusRepository = ref.watch(nativeTusUploadRepositoryProvider);
+  return UploadRepository(nativeTusRepository);
+});
 
 class UploadRepository {
+  final NativeTusUploadRepository nativeTusRepository;
   void Function(TaskStatusUpdate)? onUploadStatus;
   void Function(TaskProgressUpdate)? onTaskProgress;
 
-  UploadRepository() {
+  UploadRepository(this.nativeTusRepository) {
     FileDownloader().registerCallbacks(
       group: kBackupGroup,
       taskStatusCallback: (update) => onUploadStatus?.call(update),
@@ -95,6 +100,7 @@ class UploadRepository {
   Future<void> backupWithDartClient(Iterable<UploadTaskWithFile> tasks, CancellationToken cancelToken) async {
     final httpClient = Client();
     final String savedEndpoint = Store.get(StoreKey.serverEndpoint);
+    final String deviceId = Store.get(StoreKey.deviceId);
 
     Logger logger = Logger('UploadRepository');
     for (final candidate in tasks) {
@@ -104,11 +110,39 @@ class UploadRepository {
       }
 
       try {
+        final fileSize = candidate.file.lengthSync();
+
+        if (fileSize >= kNativeTusUploadThreshold) {
+          final metadata = NativeTusUploadMetadata(
+            filename: candidate.task.fields['filename'] ?? candidate.task.filename,
+            deviceAssetId: candidate.task.fields['deviceAssetId'] ?? '',
+            deviceId: deviceId,
+            fileCreatedAt: candidate.task.fields['fileCreatedAt'] ?? DateTime.now().toUtc().toIso8601String(),
+            fileModifiedAt: candidate.task.fields['fileModifiedAt'] ?? DateTime.now().toUtc().toIso8601String(),
+            isFavorite: candidate.task.fields['isFavorite'] == 'true',
+            duration: candidate.task.fields['duration'],
+            livePhotoVideoId: candidate.task.fields['livePhotoVideoId'],
+          );
+
+          final result = await nativeTusRepository.uploadFile(
+            candidate.file,
+            metadata,
+            onProgress: (bytesUploaded, totalBytes) {
+              logger.fine('Native tus upload progress: $bytesUploaded / $totalBytes');
+            },
+          );
+
+          if (!result.isSuccess) {
+            logger.warning('Native tus upload failed for ${candidate.task.filename}: ${result.error}');
+          }
+          continue;
+        }
+
         final fileStream = candidate.file.openRead();
         final assetRawUploadData = MultipartFile(
           "assetData",
           fileStream,
-          candidate.file.lengthSync(),
+          fileSize,
           filename: candidate.task.filename,
         );
 
