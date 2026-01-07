@@ -10,6 +10,13 @@ import createFetchMock from 'vitest-fetch-mock';
 import { checkForDuplicates, getAlbumName, startWatch, uploadFiles, UploadOptionsDto } from 'src/commands/asset';
 
 vi.mock('@immich/sdk');
+vi.mock('tus-js-client', () => ({
+  Upload: vi.fn().mockImplementation(() => ({
+    start: vi.fn(),
+    abort: vi.fn(),
+    url: 'http://example.com/upload/test-upload-id',
+  })),
+}));
 
 describe('getAlbumName', () => {
   it('should return a non-undefined value', () => {
@@ -307,5 +314,106 @@ describe('startWatch', () => {
 
   afterEach(async () => {
     await fs.promises.rm(testFolder, { recursive: true, force: true });
+  });
+});
+
+describe('uploadFiles with resumable option', () => {
+  let testDir: string;
+  let testFilePath: string;
+  let largeTestFilePath: string;
+  const smallTestFileData = 'small file data';
+  const largeTestFileData = 'a'.repeat(10 * 1024 * 1024 + 100); // 10MB + 100 bytes (above threshold)
+  const baseUrl = 'http://example.com';
+  const apiKey = 'key';
+
+  const fetchMocker = createFetchMock(vi);
+
+  beforeEach(() => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-resumable-'));
+    testFilePath = path.join(testDir, 'test.png');
+    largeTestFilePath = path.join(testDir, 'large-test.png');
+
+    fs.writeFileSync(testFilePath, smallTestFileData);
+    fs.writeFileSync(largeTestFilePath, largeTestFileData);
+
+    vi.mocked(defaults).baseUrl = baseUrl;
+    vi.mocked(defaults).headers = { 'x-api-key': apiKey };
+
+    fetchMocker.enableMocks();
+    fetchMocker.resetMocks();
+  });
+
+  afterEach(async () => {
+    await fs.promises.rm(testDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it('should use multipart upload for small files even with resumable flag', async () => {
+    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+      return {
+        status: 200,
+        body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'created' }),
+      };
+    });
+
+    await expect(uploadFiles([testFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
+      {
+        filepath: testFilePath,
+        id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
+      },
+    ]);
+  });
+
+  it('should use regular multipart upload when resumable is false', async () => {
+    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+      return {
+        status: 200,
+        body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'created' }),
+      };
+    });
+
+    await expect(uploadFiles([testFilePath], { concurrency: 1, resumable: false })).resolves.toEqual([
+      {
+        filepath: testFilePath,
+        id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
+      },
+    ]);
+  });
+
+  it('should handle upload errors gracefully', async () => {
+    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+      throw new Error('Network error');
+    });
+
+    await expect(uploadFiles([testFilePath], { concurrency: 1, resumable: false })).resolves.toEqual([]);
+  });
+
+  it('should return empty array for empty file list', async () => {
+    await expect(uploadFiles([], { concurrency: 1 })).resolves.toEqual([]);
+  });
+
+  it('should handle dry run mode', async () => {
+    const result = await uploadFiles([testFilePath], { concurrency: 1, dryRun: true });
+
+    expect(result).toEqual([{ id: '', filepath: testFilePath }]);
+    expect(fetchMocker.mock.calls.length).toBe(0);
+  });
+
+  it('should handle duplicate uploads', async () => {
+    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+      return {
+        status: 200,
+        body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'duplicate' }),
+      };
+    });
+
+    const result = await uploadFiles([testFilePath], { concurrency: 1 });
+
+    expect(result).toEqual([
+      {
+        filepath: testFilePath,
+        id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
+      },
+    ]);
   });
 });

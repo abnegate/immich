@@ -17,10 +17,11 @@ import { MultiBar, Presets, SingleBar } from 'cli-progress';
 import { chunk } from 'lodash-es';
 import micromatch from 'micromatch';
 import { Stats, createReadStream } from 'node:fs';
-import { stat, unlink } from 'node:fs/promises';
+import { readFile, stat, unlink } from 'node:fs/promises';
 import path, { basename } from 'node:path';
 import { Queue } from 'src/queue';
 import { BaseOptions, Batcher, authenticate, crawl, sha1 } from 'src/utils';
+import * as tus from 'tus-js-client';
 
 const UPLOAD_WATCH_BATCH_SIZE = 100;
 const UPLOAD_WATCH_DEBOUNCE_TIME_MS = 10_000;
@@ -30,6 +31,8 @@ const s = (count: number) => (count === 1 ? '' : 's');
 // TODO figure out why `id` is missing
 type AssetBulkUploadCheckResults = Array<AssetBulkUploadCheckResult & { id: string }>;
 type Asset = { id: string; filepath: string };
+
+const RESUMABLE_UPLOAD_THRESHOLD = 10 * 1024 * 1024;
 
 export interface UploadOptionsDto {
   recursive?: boolean;
@@ -45,9 +48,12 @@ export interface UploadOptionsDto {
   progress?: boolean;
   watch?: boolean;
   jsonOutput?: boolean;
+  resumable?: boolean;
 }
 
 class UploadFile extends File {
+  private activeStream: NodeJS.ReadableStream | null = null;
+
   constructor(
     private filepath: string,
     private _size: number,
@@ -60,7 +66,36 @@ class UploadFile extends File {
   }
 
   stream() {
-    return createReadStream(this.filepath) as any;
+    if (this.activeStream) {
+      if (typeof (this.activeStream as any).destroy === 'function') {
+        (this.activeStream as any).destroy();
+      }
+    }
+
+    const stream = createReadStream(this.filepath);
+    this.activeStream = stream as any;
+
+    stream.on('close', () => {
+      if (this.activeStream === stream) {
+        this.activeStream = null;
+      }
+    });
+    stream.on('error', () => {
+      if (this.activeStream === stream) {
+        this.activeStream = null;
+      }
+    });
+
+    return stream as any;
+  }
+
+  cleanup() {
+    if (this.activeStream) {
+      if (typeof (this.activeStream as any).destroy === 'function') {
+        (this.activeStream as any).destroy();
+      }
+      this.activeStream = null;
+    }
   }
 }
 
@@ -267,7 +302,7 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
 
 export const uploadFiles = async (
   files: string[],
-  { dryRun, concurrency, progress }: UploadOptionsDto,
+  { dryRun, concurrency, progress, resumable }: UploadOptionsDto,
 ): Promise<Asset[]> => {
   if (files.length === 0) {
     console.log('All assets were already uploaded, nothing to do.');
@@ -317,7 +352,14 @@ export const uploadFiles = async (
         throw new Error(`Stats not found for ${filepath}`);
       }
 
-      const response = await uploadFile(filepath, stats);
+      const response = await uploadFile(filepath, stats, {
+        resumable,
+        onProgress: (bytesUploaded) => {
+          uploadProgress?.update(successSize + bytesUploaded, {
+            value_formatted: byteSize(successSize + duplicateSize + bytesUploaded),
+          });
+        },
+      });
       newAssets.push({ id: response.id, filepath });
       if (response.status === AssetMediaStatus.Duplicate) {
         duplicateCount++;
@@ -359,25 +401,95 @@ export const uploadFiles = async (
   return newAssets;
 };
 
-const uploadFile = async (input: string, stats: Stats): Promise<AssetMediaResponseDto> => {
-  const { baseUrl, headers } = defaults;
-
+const getSidecarPath = async (input: string): Promise<string | undefined> => {
   const assetPath = path.parse(input);
   const noExtension = path.join(assetPath.dir, assetPath.name);
 
-  const sidecarsFiles = await Promise.all(
-    // XMP sidecars can come in two filename formats. For a photo named photo.ext, the filenames are photo.ext.xmp and photo.xmp
-    [`${noExtension}.xmp`, `${input}.xmp`].map(async (sidecarPath) => {
-      try {
-        const stats = await stat(sidecarPath);
-        return new UploadFile(sidecarPath, stats.size);
-      } catch {
-        return false;
-      }
-    }),
-  );
+  // XMP sidecars can come in two filename formats. For a photo named photo.ext, the filenames are photo.ext.xmp and photo.xmp
+  for (const sidecarPath of [`${noExtension}.xmp`, `${input}.xmp`]) {
+    try {
+      await stat(sidecarPath);
+      return sidecarPath;
+    } catch {
+      // File doesn't exist, try next
+    }
+  }
+  return undefined;
+};
 
-  const sidecarData = sidecarsFiles.find((file): file is UploadFile => file !== false);
+const uploadFileResumable = async (
+  input: string,
+  stats: Stats,
+  onProgress?: (bytesUploaded: number) => void,
+): Promise<AssetMediaResponseDto> => {
+  const { baseUrl, headers } = defaults;
+
+  const sidecarPath = await getSidecarPath(input);
+  let sidecarData: string | undefined;
+  if (sidecarPath) {
+    const sidecarBuffer = await readFile(sidecarPath);
+    sidecarData = sidecarBuffer.toString('base64');
+  }
+
+  const deviceAssetId = `${basename(input)}-${stats.size}`.replaceAll(/\s+/g, '');
+
+  return new Promise((resolve, reject) => {
+    // Create an UploadFile object that streams data instead of loading entire file into memory
+    const file = new UploadFile(input, stats.size);
+
+    const upload = new tus.Upload(file as any, {
+      endpoint: `${baseUrl}/upload`,
+      headers: headers as Record<string, string>,
+      metadata: {
+        filename: basename(input),
+        filetype: '',
+        deviceAssetId,
+        deviceId: 'CLI',
+        fileCreatedAt: stats.mtime.toISOString(),
+        fileModifiedAt: stats.mtime.toISOString(),
+        isFavorite: 'false',
+        ...(sidecarData && { sidecarData }),
+      },
+      onError: (error) => {
+        file.cleanup();
+        reject(error);
+      },
+      onProgress: (bytesUploaded) => {
+        onProgress?.(bytesUploaded);
+      },
+      onSuccess: () => {
+        file.cleanup();
+
+        const responseHeaders = (upload as any)._xhr?.getAllResponseHeaders?.() || '';
+        const assetIdMatch = responseHeaders.match(/x-immich-asset-id:\s*([^\r\n]+)/i);
+        const isDuplicateMatch = responseHeaders.match(/x-immich-duplicate:\s*([^\r\n]+)/i);
+
+        if (assetIdMatch) {
+          const assetId = assetIdMatch[1].trim();
+          const isDuplicate = isDuplicateMatch?.[1]?.trim()?.toLowerCase() === 'true';
+          resolve({
+            id: assetId,
+            status: isDuplicate ? AssetMediaStatus.Duplicate : AssetMediaStatus.Created,
+          });
+        } else {
+          reject(new Error('Asset ID not found in upload response headers. Server may not have returned X-Immich-Asset-Id header.'));
+        }
+      },
+    });
+
+    upload.start();
+  });
+};
+
+const uploadFileFormData = async (input: string, stats: Stats): Promise<AssetMediaResponseDto> => {
+  const { baseUrl, headers } = defaults;
+
+  const sidecarPath = await getSidecarPath(input);
+  let sidecarFile: UploadFile | undefined;
+  if (sidecarPath) {
+    const sidecarStats = await stat(sidecarPath);
+    sidecarFile = new UploadFile(sidecarPath, sidecarStats.size);
+  }
 
   const formData = new FormData();
   formData.append('deviceAssetId', `${basename(input)}-${stats.size}`.replaceAll(/\s+/g, ''));
@@ -388,8 +500,8 @@ const uploadFile = async (input: string, stats: Stats): Promise<AssetMediaRespon
   formData.append('isFavorite', 'false');
   formData.append('assetData', new UploadFile(input, stats.size));
 
-  if (sidecarData) {
-    formData.append('sidecarData', sidecarData);
+  if (sidecarFile) {
+    formData.append('sidecarData', sidecarFile);
   }
 
   const response = await fetch(`${baseUrl}/assets`, {
@@ -403,6 +515,20 @@ const uploadFile = async (input: string, stats: Stats): Promise<AssetMediaRespon
   }
 
   return response.json();
+};
+
+const uploadFile = async (
+  input: string,
+  stats: Stats,
+  options: { resumable?: boolean; onProgress?: (bytesUploaded: number) => void } = {},
+): Promise<AssetMediaResponseDto> => {
+  const useResumable = options.resumable && stats.size >= RESUMABLE_UPLOAD_THRESHOLD;
+
+  if (useResumable) {
+    return uploadFileResumable(input, stats, options.onProgress);
+  }
+
+  return uploadFileFormData(input, stats);
 };
 
 const deleteFiles = async (uploaded: Asset[], duplicates: Asset[], options: UploadOptionsDto): Promise<void> => {
