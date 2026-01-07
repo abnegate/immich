@@ -36,6 +36,11 @@ type TusServer = {
   handle: (req: Request, res: Response) => Promise<void>;
 };
 
+// TUS library types headers as Web API Headers, so we need .get()
+const getHeader = (headers: Headers, name: string): string | undefined => {
+  return headers.get(name) ?? undefined;
+};
+
 @Injectable()
 export class TusService extends BaseService implements OnApplicationShutdown {
   private tusServer: TusServer | null = null;
@@ -66,23 +71,25 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     this.tusServer = new Server({
       path: '/api/upload',
       datastore: new FileStore({ directory: uploadPath }),
-      respectForwardedHeaders: true,
+      relativeLocation: true,
+      getFileIdFromRequest: (req) => {
+        const url = req.url?.split('?')[0] || '';
+        const match = url.match(/\/api\/upload\/(.+)/);
+        return match?.[1];
+      },
       namingFunction: (req, _metadata) => {
-        // Generate a unique ID for the upload
         const uuid = self.cryptoRepository.randomUUID();
-        // Get metadata to create proper folder structure
-        const auth = (req as any).auth as AuthDto | undefined;
-        if (auth?.user?.id) {
-          const folder = StorageCore.getNestedFolder(StorageFolder.Upload, auth.user.id, uuid);
+        const userId = getHeader(req.headers, 'x-immich-user-id');
+        if (userId) {
+          const folder = StorageCore.getNestedFolder(StorageFolder.Upload, userId, uuid);
           self.storageRepository.mkdirSync(folder);
-          return join(auth.user.id, uuid.slice(0, 2), uuid.slice(2, 4), uuid);
+          return join(userId, uuid.slice(0, 2), uuid.slice(2, 4), uuid);
         }
         return uuid;
       },
-      onIncomingRequest: async (req, _res, uploadId) => {
-        // Validate auth for all requests
-        const auth = (req as any).auth as AuthDto | undefined;
-        if (!auth?.user) {
+      onIncomingRequest: async (req, uploadId) => {
+        const userId = getHeader(req.headers, 'x-immich-user-id');
+        if (!userId) {
           throw self.toTusError(401, 'Unauthorized');
         }
 
@@ -94,15 +101,14 @@ export class TusService extends BaseService implements OnApplicationShutdown {
             throw self.toTusError(403, 'Forbidden: Invalid upload path format');
           }
           const uploadUserId = uploadPathParts[0];
-          if (uploadUserId !== auth.user.id) {
+          if (uploadUserId !== userId) {
             throw self.toTusError(403, 'Forbidden: Upload does not belong to user');
           }
         }
       },
       onUploadCreate: async (req, upload) => {
-        // Validate authentication
-        const auth = (req as any).auth as AuthDto | undefined;
-        if (!auth?.user) {
+        const userId = getHeader(req.headers, 'x-immich-user-id');
+        if (!userId) {
           throw self.toTusError(401, 'Unauthorized');
         }
 
@@ -125,20 +131,19 @@ export class TusService extends BaseService implements OnApplicationShutdown {
         }
 
         // Check quota
+        const quotaSize = getHeader(req.headers, 'x-immich-quota-size');
+        const quotaUsage = getHeader(req.headers, 'x-immich-quota-usage');
         const uploadSize = upload.size || 0;
-        if (
-          auth.user.quotaSizeInBytes !== null &&
-          auth.user.quotaSizeInBytes < auth.user.quotaUsageInBytes + uploadSize
-        ) {
+        if (quotaSize && Number(quotaSize) < Number(quotaUsage) + uploadSize) {
           throw self.toTusError(400, 'Quota has been exceeded!');
         }
 
-        self.logger.log(`Upload created: ${upload.id} for user ${auth.user.id}`);
+        self.logger.log(`Upload created: ${upload.id} for user ${userId}`);
         return {};
       },
       onUploadFinish: async (req, upload) => {
-        const auth = (req as any).auth as AuthDto | undefined;
-        if (!auth?.user) {
+        const userId = getHeader(req.headers, 'x-immich-user-id');
+        if (!userId) {
           throw self.toTusError(401, 'Unauthorized');
         }
 
@@ -146,7 +151,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
         const filePath = join(uploadPath, upload.id);
 
         try {
-          const { assetId, isDuplicate } = await self.createAssetFromUpload(auth, upload);
+          const { assetId, isDuplicate } = await self.createAssetFromUpload(userId, upload);
           self.logger.log(`Upload finished: ${upload.id} -> Asset ${assetId}${isDuplicate ? ' (duplicate)' : ''}`);
 
           // Return asset ID and duplicate status in response headers
@@ -174,8 +179,10 @@ export class TusService extends BaseService implements OnApplicationShutdown {
   }
 
   async handleTusUpload(auth: AuthDto, req: Request, res: Response): Promise<void> {
-    // Attach auth to request for use in tus callbacks
-    (req as any).auth = auth;
+    // Pass auth via custom header - TUS library preserves headers
+    req.headers['x-immich-user-id'] = auth.user.id;
+    req.headers['x-immich-quota-size'] = String(auth.user.quotaSizeInBytes ?? '');
+    req.headers['x-immich-quota-usage'] = String(auth.user.quotaUsageInBytes ?? 0);
 
     const server = await this.initializeTusServer();
     return server.handle(req, res);
@@ -202,33 +209,22 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       return {};
     }
 
-    // Helper function to decode base64 values
-    const decodeValue = (value: string | null | undefined): string | undefined => {
-      if (!value) return undefined;
-      try {
-        return Buffer.from(value, 'base64').toString('utf-8');
-      } catch (error) {
-        this.logger.warn(`Failed to decode base64 value: ${error}`);
-        return value;
-      }
-    };
-
     return {
-      filename: decodeValue(metadata.filename),
-      filetype: decodeValue(metadata.filetype),
-      deviceAssetId: decodeValue(metadata.deviceAssetId),
-      deviceId: decodeValue(metadata.deviceId),
-      fileCreatedAt: decodeValue(metadata.fileCreatedAt),
-      fileModifiedAt: decodeValue(metadata.fileModifiedAt),
-      duration: decodeValue(metadata.duration),
-      isFavorite: decodeValue(metadata.isFavorite),
-      visibility: decodeValue(metadata.visibility),
-      livePhotoVideoId: decodeValue(metadata.livePhotoVideoId),
-      sidecarData: decodeValue(metadata.sidecarData),
+      filename: metadata.filename ?? undefined,
+      filetype: metadata.filetype ?? undefined,
+      deviceAssetId: metadata.deviceAssetId ?? undefined,
+      deviceId: metadata.deviceId ?? undefined,
+      fileCreatedAt: metadata.fileCreatedAt ?? undefined,
+      fileModifiedAt: metadata.fileModifiedAt ?? undefined,
+      duration: metadata.duration ?? undefined,
+      isFavorite: metadata.isFavorite ?? undefined,
+      visibility: metadata.visibility ?? undefined,
+      livePhotoVideoId: metadata.livePhotoVideoId ?? undefined,
+      sidecarData: metadata.sidecarData ?? undefined,
     };
   }
 
-  private async createAssetFromUpload(auth: AuthDto, upload: Upload): Promise<{ assetId: string; isDuplicate: boolean }> {
+  private async createAssetFromUpload(userId: string, upload: Upload): Promise<{ assetId: string; isDuplicate: boolean }> {
     const metadata = this.parseMetadata(upload.metadata);
 
     if (!metadata.filename || !metadata.deviceAssetId || !metadata.deviceId) {
@@ -242,7 +238,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     const checksum = await this.calculateChecksum(filePath);
 
     // Check for duplicate
-    const existingAssetId = await this.assetRepository.getUploadAssetIdByChecksum(auth.user.id, checksum);
+    const existingAssetId = await this.assetRepository.getUploadAssetIdByChecksum(userId, checksum);
     if (existingAssetId) {
       // Clean up the uploaded file since it's a duplicate
       await this.jobRepository.queue({ name: JobName.FileDelete, data: { files: [filePath] } });
@@ -278,7 +274,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
 
     // Create asset
     const asset = await this.assetRepository.create({
-      ownerId: auth.user.id,
+      ownerId: userId,
       libraryId: null,
       checksum,
       originalPath: filePath,
@@ -287,7 +283,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       fileCreatedAt,
       fileModifiedAt,
       localDateTime: fileCreatedAt,
-      type: mimeTypes.assetType(filePath),
+      type: mimeTypes.assetType(metadata.filename),
       isFavorite: metadata.isFavorite === 'true',
       duration: metadata.duration || null,
       visibility: visibility ?? AssetVisibility.Timeline,
@@ -329,7 +325,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     }
 
     // Update user quota
-    await this.userRepository.updateUsage(auth.user.id, fileSize);
+    await this.userRepository.updateUsage(userId, fileSize);
 
     // Emit event
     await this.eventRepository.emit('AssetCreate', { asset });
