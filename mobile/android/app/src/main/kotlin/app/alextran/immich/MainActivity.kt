@@ -15,6 +15,8 @@ import app.alextran.immich.images.ThumbnailsImpl
 import app.alextran.immich.sync.NativeSyncApi
 import app.alextran.immich.sync.NativeSyncApiImpl26
 import app.alextran.immich.sync.NativeSyncApiImpl30
+import app.alextran.immich.upload.TusUploadApi
+import app.alextran.immich.upload.TusUploadApiImpl
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 
@@ -35,15 +37,18 @@ class MainActivity : FlutterFragmentActivity() {
         } else {
           NativeSyncApiImpl30(ctx)
         }
+      val tusUploadApiImpl = TusUploadApiImpl(ctx)
       NativeSyncApi.setUp(messenger, nativeSyncApiImpl)
       ThumbnailApi.setUp(messenger, ThumbnailsImpl(ctx))
       BackgroundWorkerFgHostApi.setUp(messenger, BackgroundWorkerApiImpl(ctx))
       ConnectivityApi.setUp(messenger, ConnectivityApiImpl(ctx))
+      TusUploadApi.setUp(messenger, tusUploadApiImpl)
 
       flutterEngine.plugins.add(BackgroundServicePlugin())
       flutterEngine.plugins.add(HttpSSLOptionsPlugin())
       flutterEngine.plugins.add(backgroundEngineLockImpl)
       flutterEngine.plugins.add(nativeSyncApiImpl)
+      flutterEngine.plugins.add(tusUploadApiImpl)
     }
 
     fun cancelPlugins(flutterEngine: FlutterEngine) {
