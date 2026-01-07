@@ -474,6 +474,7 @@ export enum MetadataKey {
 export enum RouteKey {
   Asset = 'assets',
   User = 'users',
+  Upload = 'upload',
 }
 
 export enum CacheControl {
