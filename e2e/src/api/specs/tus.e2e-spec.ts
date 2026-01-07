@@ -480,6 +480,150 @@ describe('/upload (TUS protocol)', () => {
     });
   });
 
+  describe('Large file uploads', () => {
+    it('should handle large file upload with multiple 10MB chunks', async () => {
+      // Create a 25MB buffer to test chunked upload behavior (exceeds 10MB threshold)
+      const fileSize = 25 * 1024 * 1024;
+      const largeData = Buffer.alloc(fileSize);
+      // Fill with random-ish data to avoid compression issues
+      for (let i = 0; i < fileSize; i += 1024) {
+        largeData[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'large-file-test.bin',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'large-file-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = createResponse.headers['location'].split('/').pop();
+
+      const chunkSize = 10 * 1024 * 1024;
+      let offset = 0;
+      let lastResponse;
+
+      while (offset < fileSize) {
+        const end = Math.min(offset + chunkSize, fileSize);
+        const chunk = largeData.subarray(offset, end);
+
+        lastResponse = await uploadChunk(user.accessToken, uploadId, chunk, offset);
+        expect(lastResponse.status).toBe(204);
+        expect(lastResponse.headers['upload-offset']).toBe(end.toString());
+
+        offset = end;
+      }
+
+      // Verify upload completed successfully
+      expect(lastResponse!.headers['x-immich-asset-id']).toBeDefined();
+      const assetId = lastResponse!.headers['x-immich-asset-id'];
+
+      // Verify asset was created
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.id).toBe(assetId);
+      expect(asset.originalFileName).toBe('large-file-test.bin');
+    }, 60_000); // 60 second timeout for large upload
+
+    it('should resume large file upload after interruption', async () => {
+      // Create a 15MB buffer
+      const fileSize = 15 * 1024 * 1024;
+      const largeData = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        largeData[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'resume-large-test.bin',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'resume-large-test-1',
+        },
+      });
+
+      const uploadId = createResponse.headers['location'].split('/').pop();
+
+      // Upload first 5MB chunk
+      const firstChunkSize = 5 * 1024 * 1024;
+      const firstChunk = largeData.subarray(0, firstChunkSize);
+      await uploadChunk(user.accessToken, uploadId, firstChunk, 0);
+
+      // Simulate "interruption" - check status via HEAD
+      const statusResponse = await getUploadStatus(user.accessToken, uploadId);
+      expect(statusResponse.status).toBe(200);
+      expect(statusResponse.headers['upload-offset']).toBe(firstChunkSize.toString());
+
+      // Resume upload from where we left off
+      const offset = Number.parseInt(statusResponse.headers['upload-offset']);
+      const remainingData = largeData.subarray(offset);
+      const resumeResponse = await uploadChunk(user.accessToken, uploadId, remainingData, offset);
+
+      expect(resumeResponse.status).toBe(204);
+      expect(resumeResponse.headers['upload-offset']).toBe(fileSize.toString());
+      expect(resumeResponse.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = resumeResponse.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset.originalFileName).toBe('resume-large-test.bin');
+    }, 60_000);
+
+    it('should resume upload after partial chunk failure', async () => {
+      // Create a 20MB buffer
+      const fileSize = 20 * 1024 * 1024;
+      const largeData = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        largeData[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'failure-resume-test.bin',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'failure-resume-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = createResponse.headers['location'].split('/').pop();
+
+      // Upload first chunk successfully (5MB)
+      const chunkSize = 5 * 1024 * 1024;
+      const chunk1 = largeData.subarray(0, chunkSize);
+      const response1 = await uploadChunk(user.accessToken, uploadId, chunk1, 0);
+      expect(response1.status).toBe(204);
+
+      // Upload second chunk successfully (5MB)
+      const chunk2 = largeData.subarray(chunkSize, chunkSize * 2);
+      const response2 = await uploadChunk(user.accessToken, uploadId, chunk2, chunkSize);
+      expect(response2.status).toBe(204);
+
+      // Simulate failure recovery: check status via HEAD to get current offset
+      const statusAfterPartial = await getUploadStatus(user.accessToken, uploadId);
+      expect(statusAfterPartial.status).toBe(200);
+      const currentOffset = Number.parseInt(statusAfterPartial.headers['upload-offset']);
+      expect(currentOffset).toBe(chunkSize * 2); // Should be at 10MB
+
+      // Resume from the correct offset (simulating client recovery after failure)
+      const chunk3 = largeData.subarray(currentOffset, currentOffset + chunkSize);
+      const response3 = await uploadChunk(user.accessToken, uploadId, chunk3, currentOffset);
+      expect(response3.status).toBe(204);
+
+      // Final chunk
+      const chunk4 = largeData.subarray(currentOffset + chunkSize);
+      const response4 = await uploadChunk(user.accessToken, uploadId, chunk4, currentOffset + chunkSize);
+      expect(response4.status).toBe(204);
+      expect(response4.headers['x-immich-asset-id']).toBeDefined();
+
+      // Verify the asset was created correctly
+      const assetId = response4.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.originalFileName).toBe('failure-resume-test.bin');
+    }, 60_000);
+  });
+
   describe('Resumable upload flow', () => {
     it('should resume interrupted upload', async () => {
       const imageData = makeRandomImage();
