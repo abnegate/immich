@@ -101,7 +101,9 @@ describe(TusController.name, () => {
     });
   });
 
-  describe('ALL /upload/:id', () => {
+  describe('ALL /upload/*', () => {
+    // Note: With the wildcard route @All('*'), the upload ID is extracted from the URL
+    // by the TUS library's getFileIdFromRequest, not from req.params
     const uploadId = 'test-upload-id-123';
 
     it('should be an authenticated route', async () => {
@@ -112,7 +114,7 @@ describe(TusController.name, () => {
       expect(ctx.authenticate).toHaveBeenCalled();
     });
 
-    it('should call service.handleTusUpload with upload ID in params for POST', async () => {
+    it('should call service.handleTusUpload with upload ID in URL for POST', async () => {
       service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
         res.status(200).send();
       });
@@ -124,7 +126,7 @@ describe(TusController.name, () => {
       expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
       const [, req] = service.handleTusUpload.mock.calls[0];
       expect(req.method).toBe('POST');
-      expect(req.params.id).toBe(uploadId);
+      expect(req.url).toContain(uploadId);
     });
 
     it('should call service.handleTusUpload for PATCH with upload ID', async () => {
@@ -141,7 +143,7 @@ describe(TusController.name, () => {
       expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
       const [, req] = service.handleTusUpload.mock.calls[0];
       expect(req.method).toBe('PATCH');
-      expect(req.params.id).toBe(uploadId);
+      expect(req.url).toContain(uploadId);
     });
 
     it('should call service.handleTusUpload for HEAD with upload ID', async () => {
@@ -154,7 +156,7 @@ describe(TusController.name, () => {
       expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
       const [, req] = service.handleTusUpload.mock.calls[0];
       expect(req.method).toBe('HEAD');
-      expect(req.params.id).toBe(uploadId);
+      expect(req.url).toContain(uploadId);
     });
 
     it('should call service.handleTusUpload for DELETE with upload ID', async () => {
@@ -167,7 +169,7 @@ describe(TusController.name, () => {
       expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
       const [, req] = service.handleTusUpload.mock.calls[0];
       expect(req.method).toBe('DELETE');
-      expect(req.params.id).toBe(uploadId);
+      expect(req.url).toContain(uploadId);
     });
 
     it('should call service.handleTusUpload for OPTIONS with upload ID', async () => {
@@ -180,7 +182,7 @@ describe(TusController.name, () => {
       expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
       const [, req] = service.handleTusUpload.mock.calls[0];
       expect(req.method).toBe('OPTIONS');
-      expect(req.params.id).toBe(uploadId);
+      expect(req.url).toContain(uploadId);
     });
 
     it('should handle service errors', async () => {
@@ -201,7 +203,7 @@ describe(TusController.name, () => {
 
       expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
       const [, req] = service.handleTusUpload.mock.calls[0];
-      expect(req.params.id).toBe(differentId);
+      expect(req.url).toContain(differentId);
     });
   });
 });

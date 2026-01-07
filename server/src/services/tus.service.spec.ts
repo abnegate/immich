@@ -22,16 +22,17 @@ vi.mock('@tus/file-store', () => ({
   FileStore: vi.fn().mockImplementation(() => ({})),
 }));
 
+// TUS library decodes base64 metadata before passing to callbacks, so use plain text
 const mockUpload = {
   id: 'upload-id.jpg',
   size: 1000,
   offset: 0,
   metadata: {
-    filename: Buffer.from('test.jpg').toString('base64'),
-    deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-    deviceId: Buffer.from('device-id').toString('base64'),
-    fileCreatedAt: Buffer.from('2023-01-01T00:00:00.000Z').toString('base64'),
-    fileModifiedAt: Buffer.from('2023-01-01T00:00:00.000Z').toString('base64'),
+    filename: 'test.jpg',
+    deviceAssetId: 'device-asset-id',
+    deviceId: 'device-id',
+    fileCreatedAt: '2023-01-01T00:00:00.000Z',
+    fileModifiedAt: '2023-01-01T00:00:00.000Z',
   },
   creation_date: '2023-01-01T00:00:00.000Z',
 };
@@ -40,7 +41,7 @@ const mockUploadWithSidecar = {
   ...mockUpload,
   metadata: {
     ...mockUpload.metadata,
-    sidecarData: Buffer.from('sidecar content').toString('base64'),
+    sidecarData: Buffer.from('sidecar content').toString('base64'), // sidecarData is still base64 encoded
   },
 };
 
@@ -49,8 +50,8 @@ const mockUploadVideo = {
   id: 'upload-id.mp4',
   metadata: {
     ...mockUpload.metadata,
-    filename: Buffer.from('test.mp4').toString('base64'),
-    duration: Buffer.from('10.5').toString('base64'),
+    filename: 'test.mp4',
+    duration: '10.5',
   },
 };
 
@@ -65,11 +66,13 @@ describe(TusService.name, () => {
   });
 
   describe('parseMetadata', () => {
-    it('should decode Base64 encoded metadata values', () => {
+    // Note: TUS library decodes base64 metadata before passing to callbacks,
+    // so parseMetadata just handles null-to-undefined conversion
+    it('should pass through already-decoded metadata values', () => {
       const metadata = {
-        filename: Buffer.from('test.jpg').toString('base64'),
-        deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-        deviceId: Buffer.from('device-id').toString('base64'),
+        filename: 'test.jpg',
+        deviceAssetId: 'device-asset-id',
+        deviceId: 'device-id',
       };
 
       const result = (sut as any).parseMetadata(metadata);
@@ -135,34 +138,20 @@ describe(TusService.name, () => {
       });
     });
 
-    it('should handle invalid Base64 gracefully (fallback to original value)', () => {
+    it('should pass through all supported metadata fields', () => {
+      // TUS library decodes base64 metadata before passing to callbacks
       const metadata = {
-        filename: 'not-valid-base64!@#$%',
-        deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-        deviceId: Buffer.from('device-id').toString('base64'),
-      };
-
-      const result = (sut as any).parseMetadata(metadata);
-
-      // Invalid base64 should fall back to the original value
-      expect(result.filename).toBeDefined();
-      expect(result.deviceAssetId).toBe('device-asset-id');
-      expect(result.deviceId).toBe('device-id');
-    });
-
-    it('should decode all supported metadata fields', () => {
-      const metadata = {
-        filename: Buffer.from('test.jpg').toString('base64'),
-        filetype: Buffer.from('image/jpeg').toString('base64'),
-        deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-        deviceId: Buffer.from('device-id').toString('base64'),
-        fileCreatedAt: Buffer.from('2023-01-01T00:00:00.000Z').toString('base64'),
-        fileModifiedAt: Buffer.from('2023-01-02T00:00:00.000Z').toString('base64'),
-        duration: Buffer.from('10.5').toString('base64'),
-        isFavorite: Buffer.from('true').toString('base64'),
-        visibility: Buffer.from('timeline').toString('base64'),
-        livePhotoVideoId: Buffer.from('video-id').toString('base64'),
-        sidecarData: Buffer.from('sidecar content').toString('base64'),
+        filename: 'test.jpg',
+        filetype: 'image/jpeg',
+        deviceAssetId: 'device-asset-id',
+        deviceId: 'device-id',
+        fileCreatedAt: '2023-01-01T00:00:00.000Z',
+        fileModifiedAt: '2023-01-02T00:00:00.000Z',
+        duration: '10.5',
+        isFavorite: 'true',
+        visibility: 'timeline',
+        livePhotoVideoId: 'video-id',
+        sidecarData: 'c2lkZWNhciBjb250ZW50', // sidecarData stays as base64 for us to decode
       };
 
       const result = (sut as any).parseMetadata(metadata);
@@ -178,44 +167,50 @@ describe(TusService.name, () => {
         isFavorite: 'true',
         visibility: 'timeline',
         livePhotoVideoId: 'video-id',
-        sidecarData: 'sidecar content',
+        sidecarData: 'c2lkZWNhciBjb250ZW50',
       });
     });
   });
 
   describe('onUploadCreate validation', () => {
+    // Helper to create mock request with Web API Headers (as TUS library provides)
+    const createMockReq = (userId?: string, quotaSize?: number | null, quotaUsage?: number) => {
+      const headersMap = new Map<string, string>();
+      if (userId) {
+        headersMap.set('x-immich-user-id', userId);
+      }
+      if (quotaSize !== undefined) {
+        headersMap.set('x-immich-quota-size', String(quotaSize ?? ''));
+      }
+      if (quotaUsage !== undefined) {
+        headersMap.set('x-immich-quota-usage', String(quotaUsage));
+      }
+      return {
+        headers: {
+          get: (name: string) => headersMap.get(name) ?? null,
+        },
+      };
+    };
+
     let mockReq: any;
     let upload: any;
 
     beforeEach(() => {
-      mockReq = {
-        auth: authStub.user1,
-      };
+      mockReq = createMockReq(authStub.user1.user.id, null, 0);
+      // TUS library decodes base64 metadata before passing to callbacks
       upload = {
         id: 'upload-id',
         size: 1000,
         metadata: {
-          filename: Buffer.from('test.jpg').toString('base64'),
-          deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-          deviceId: Buffer.from('device-id').toString('base64'),
+          filename: 'test.jpg',
+          deviceAssetId: 'device-asset-id',
+          deviceId: 'device-id',
         },
       };
     });
 
     it('should reject if user not authenticated', async () => {
-      mockReq.auth = undefined;
-
-      const tusServer = await (sut as any).initializeTusServer();
-      const onUploadCreate = (tusServer as any).options.onUploadCreate;
-
-      await expect(onUploadCreate(mockReq, upload)).rejects.toEqual({
-        status_code: 401,
-        body: 'Unauthorized',
-      });
-    });
-
-    it('should reject if user is null', async () => {
-      mockReq.auth = { user: null };
+      mockReq = createMockReq(); // No user ID
 
       const tusServer = await (sut as any).initializeTusServer();
       const onUploadCreate = (tusServer as any).options.onUploadCreate;
@@ -228,8 +223,8 @@ describe(TusService.name, () => {
 
     it('should reject if filename missing', async () => {
       upload.metadata = {
-        deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-        deviceId: Buffer.from('device-id').toString('base64'),
+        deviceAssetId: 'device-asset-id',
+        deviceId: 'device-id',
       };
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -243,8 +238,8 @@ describe(TusService.name, () => {
 
     it('should reject if deviceAssetId missing', async () => {
       upload.metadata = {
-        filename: Buffer.from('test.jpg').toString('base64'),
-        deviceId: Buffer.from('device-id').toString('base64'),
+        filename: 'test.jpg',
+        deviceId: 'device-id',
       };
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -258,8 +253,8 @@ describe(TusService.name, () => {
 
     it('should reject if deviceId missing', async () => {
       upload.metadata = {
-        filename: Buffer.from('test.jpg').toString('base64'),
-        deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
+        filename: 'test.jpg',
+        deviceAssetId: 'device-asset-id',
       };
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -273,9 +268,9 @@ describe(TusService.name, () => {
 
     it('should reject unsupported file types', async () => {
       upload.metadata = {
-        filename: Buffer.from('test.txt').toString('base64'),
-        deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-        deviceId: Buffer.from('device-id').toString('base64'),
+        filename: 'test.txt',
+        deviceAssetId: 'device-asset-id',
+        deviceId: 'device-id',
       };
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -288,13 +283,7 @@ describe(TusService.name, () => {
     });
 
     it('should reject if quota exceeded', async () => {
-      mockReq.auth = {
-        user: {
-          ...authStub.user1.user,
-          quotaSizeInBytes: 1000,
-          quotaUsageInBytes: 500,
-        },
-      };
+      mockReq = createMockReq(authStub.user1.user.id, 1000, 500);
       upload.size = 600; // Would exceed quota
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -317,9 +306,9 @@ describe(TusService.name, () => {
 
     it('should allow valid upload with video', async () => {
       upload.metadata = {
-        filename: Buffer.from('test.mp4').toString('base64'),
-        deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-        deviceId: Buffer.from('device-id').toString('base64'),
+        filename: 'test.mp4',
+        deviceAssetId: 'device-asset-id',
+        deviceId: 'device-id',
       };
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -331,13 +320,7 @@ describe(TusService.name, () => {
     });
 
     it('should allow upload when quota is null (unlimited)', async () => {
-      mockReq.auth = {
-        user: {
-          ...authStub.user1.user,
-          quotaSizeInBytes: null,
-          quotaUsageInBytes: 500,
-        },
-      };
+      mockReq = createMockReq(authStub.user1.user.id, null, 500);
       upload.size = 1_000_000; // Large file
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -349,13 +332,7 @@ describe(TusService.name, () => {
     });
 
     it('should allow upload when quota not exceeded', async () => {
-      mockReq.auth = {
-        user: {
-          ...authStub.user1.user,
-          quotaSizeInBytes: 10_000,
-          quotaUsageInBytes: 5_000,
-        },
-      };
+      mockReq = createMockReq(authStub.user1.user.id, 10_000, 5_000);
       upload.size = 4_000; // Within quota
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -369,6 +346,7 @@ describe(TusService.name, () => {
 
   describe('createAssetFromUpload', () => {
     const checksum = Buffer.from('test-checksum');
+    const userId = authStub.user1.user.id;
 
     beforeEach(() => {
       mocks.crypto.randomUUID.mockReturnValue('random-uuid');
@@ -379,20 +357,19 @@ describe(TusService.name, () => {
     });
 
     it('should create asset with correct metadata', async () => {
-      const auth = authStub.user1;
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      const result = await (sut as any).createAssetFromUpload(auth, upload);
+      const result = await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(result).toEqual({ assetId: 'asset-id', isDuplicate: false });
       expect(mocks.asset.create).toHaveBeenCalledWith({
-        ownerId: auth.user.id,
+        ownerId: userId,
         libraryId: null,
         checksum,
         originalPath: '/data/upload/upload-id.jpg',
@@ -411,12 +388,11 @@ describe(TusService.name, () => {
     });
 
     it('should detect and handle duplicate uploads', async () => {
-      const auth = authStub.user1;
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue('existing-asset-id');
 
-      const result = await (sut as any).createAssetFromUpload(auth, upload);
+      const result = await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(result).toEqual({ assetId: 'existing-asset-id', isDuplicate: true });
       expect(mocks.asset.create).not.toHaveBeenCalled();
@@ -427,16 +403,15 @@ describe(TusService.name, () => {
     });
 
     it('should handle sidecar data', async () => {
-      const auth = authStub.user1;
       const upload = mockUploadWithSidecar;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      const result = await (sut as any).createAssetFromUpload(auth, upload);
+      const result = await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(result).toEqual({ assetId: 'asset-id', isDuplicate: false });
       expect(mocks.storage.createOrOverwriteFile).toHaveBeenCalledWith(
@@ -451,20 +426,19 @@ describe(TusService.name, () => {
     });
 
     it('should handle sidecar write errors gracefully', async () => {
-      const auth = authStub.user1;
       const upload = mockUploadWithSidecar;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
       // Mock storage to throw an error when writing sidecar
       mocks.storage.createOrOverwriteFile.mockRejectedValue(new Error('Write error'));
 
       // Should not throw even when sidecar write fails
-      const result = await (sut as any).createAssetFromUpload(auth, upload);
+      const result = await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(result).toEqual({ assetId: 'asset-id', isDuplicate: false });
       // Sidecar file write should have been attempted
@@ -474,31 +448,29 @@ describe(TusService.name, () => {
     });
 
     it('should update user quota', async () => {
-      const auth = authStub.user1;
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
-      expect(mocks.user.updateUsage).toHaveBeenCalledWith(auth.user.id, 1000);
+      expect(mocks.user.updateUsage).toHaveBeenCalledWith(userId, 1000);
     });
 
     it('should queue metadata extraction job', async () => {
-      const auth = authStub.user1;
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.job.queue).toHaveBeenCalledWith({
         name: JobName.AssetExtractMetadata,
@@ -507,16 +479,15 @@ describe(TusService.name, () => {
     });
 
     it('should emit AssetCreate event', async () => {
-      const auth = authStub.user1;
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.event.emit).toHaveBeenCalledWith('AssetCreate', {
         asset: expect.objectContaining({ id: 'asset-id' }),
@@ -524,16 +495,15 @@ describe(TusService.name, () => {
     });
 
     it('should handle video assets correctly', async () => {
-      const auth = authStub.user1;
       const upload = mockUploadVideo;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -544,22 +514,22 @@ describe(TusService.name, () => {
     });
 
     it('should set isFavorite when metadata is true', async () => {
-      const auth = authStub.user1;
+      // TUS library decodes base64 metadata before passing to callbacks
       const upload = {
         ...mockUpload,
         metadata: {
           ...mockUpload.metadata,
-          isFavorite: Buffer.from('true').toString('base64'),
+          isFavorite: 'true',
         },
       };
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -569,22 +539,21 @@ describe(TusService.name, () => {
     });
 
     it('should set isFavorite to false when metadata is not true', async () => {
-      const auth = authStub.user1;
       const upload = {
         ...mockUpload,
         metadata: {
           ...mockUpload.metadata,
-          isFavorite: Buffer.from('false').toString('base64'),
+          isFavorite: 'false',
         },
       };
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -594,22 +563,21 @@ describe(TusService.name, () => {
     });
 
     it('should set visibility from metadata', async () => {
-      const auth = authStub.user1;
       const upload = {
         ...mockUpload,
         metadata: {
           ...mockUpload.metadata,
-          visibility: Buffer.from('hidden').toString('base64'),
+          visibility: 'hidden',
         },
       };
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -619,22 +587,21 @@ describe(TusService.name, () => {
     });
 
     it('should default to timeline visibility for invalid visibility value', async () => {
-      const auth = authStub.user1;
       const upload = {
         ...mockUpload,
         metadata: {
           ...mockUpload.metadata,
-          visibility: Buffer.from('invalid-visibility').toString('base64'),
+          visibility: 'invalid-visibility',
         },
       };
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -644,22 +611,21 @@ describe(TusService.name, () => {
     });
 
     it('should set livePhotoVideoId from metadata', async () => {
-      const auth = authStub.user1;
       const upload = {
         ...mockUpload,
         metadata: {
           ...mockUpload.metadata,
-          livePhotoVideoId: Buffer.from('video-id').toString('base64'),
+          livePhotoVideoId: 'video-id',
         },
       };
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -669,16 +635,15 @@ describe(TusService.name, () => {
     });
 
     it('should update file timestamps', async () => {
-      const auth = authStub.user1;
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.storage.utimes).toHaveBeenCalledWith(
         '/data/upload/upload-id.jpg',
@@ -688,16 +653,15 @@ describe(TusService.name, () => {
     });
 
     it('should upsert exif with file size', async () => {
-      const auth = authStub.user1;
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.asset.upsertExif).toHaveBeenCalledWith(
         { assetId: 'asset-id', fileSizeInByte: 1000 },
@@ -706,62 +670,58 @@ describe(TusService.name, () => {
     });
 
     it('should throw BadRequestException if filename is missing', async () => {
-      const auth = authStub.user1;
       const upload = {
         ...mockUpload,
         metadata: {
-          deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-          deviceId: Buffer.from('device-id').toString('base64'),
+          deviceAssetId: 'device-asset-id',
+          deviceId: 'device-id',
         },
       };
 
-      await expect((sut as any).createAssetFromUpload(auth, upload)).rejects.toThrow(BadRequestException);
+      await expect((sut as any).createAssetFromUpload(userId, upload)).rejects.toThrow(BadRequestException);
     });
 
     it('should throw BadRequestException if deviceAssetId is missing', async () => {
-      const auth = authStub.user1;
       const upload = {
         ...mockUpload,
         metadata: {
-          filename: Buffer.from('test.jpg').toString('base64'),
-          deviceId: Buffer.from('device-id').toString('base64'),
+          filename: 'test.jpg',
+          deviceId: 'device-id',
         },
       };
 
-      await expect((sut as any).createAssetFromUpload(auth, upload)).rejects.toThrow(BadRequestException);
+      await expect((sut as any).createAssetFromUpload(userId, upload)).rejects.toThrow(BadRequestException);
     });
 
     it('should throw BadRequestException if deviceId is missing', async () => {
-      const auth = authStub.user1;
       const upload = {
         ...mockUpload,
         metadata: {
-          filename: Buffer.from('test.jpg').toString('base64'),
-          deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
+          filename: 'test.jpg',
+          deviceAssetId: 'device-asset-id',
         },
       };
 
-      await expect((sut as any).createAssetFromUpload(auth, upload)).rejects.toThrow(BadRequestException);
+      await expect((sut as any).createAssetFromUpload(userId, upload)).rejects.toThrow(BadRequestException);
     });
 
     it('should use current date for fileCreatedAt if not provided', async () => {
-      const auth = authStub.user1;
       const upload = {
         ...mockUpload,
         metadata: {
-          filename: Buffer.from('test.jpg').toString('base64'),
-          deviceAssetId: Buffer.from('device-asset-id').toString('base64'),
-          deviceId: Buffer.from('device-id').toString('base64'),
+          filename: 'test.jpg',
+          deviceAssetId: 'device-asset-id',
+          deviceId: 'device-id',
         },
       };
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
-        ownerId: auth.user.id,
+        ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -772,21 +732,20 @@ describe(TusService.name, () => {
     });
 
     it('should not update usage when duplicate is found', async () => {
-      const auth = authStub.user1;
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue('existing-asset-id');
 
-      await (sut as any).createAssetFromUpload(auth, upload);
+      await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(mocks.user.updateUsage).not.toHaveBeenCalled();
     });
   });
 
   describe('handleTusUpload', () => {
-    it('should attach auth to request and call tus server', async () => {
+    it('should attach auth to request headers and call tus server', async () => {
       const auth = authStub.user1;
-      const mockReq = {} as Request;
+      const mockReq = { headers: {} } as unknown as Request;
       const mockRes = {} as Response;
 
       const mockHandle = vi.fn().mockResolvedValue(undefined);
@@ -799,7 +758,9 @@ describe(TusService.name, () => {
 
       await sut.handleTusUpload(auth, mockReq, mockRes);
 
-      expect((mockReq as any).auth).toBe(auth);
+      expect(mockReq.headers['x-immich-user-id']).toBe(auth.user.id);
+      expect(mockReq.headers['x-immich-quota-size']).toBe(String(auth.user.quotaSizeInBytes ?? ''));
+      expect(mockReq.headers['x-immich-quota-usage']).toBe(String(auth.user.quotaUsageInBytes ?? 0));
       expect(mockHandle).toHaveBeenCalledWith(mockReq, mockRes);
     });
   });
