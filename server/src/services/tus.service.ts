@@ -5,10 +5,13 @@ import { createReadStream } from 'node:fs';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { StorageCore } from 'src/cores/storage.core';
+import { OnJob } from 'src/decorators';
 import { AuthDto } from 'src/dtos/auth.dto';
-import { AssetFileType, AssetVisibility, JobName, StorageFolder } from 'src/enum';
+import { AssetFileType, AssetVisibility, JobName, JobStatus, QueueName, StorageFolder } from 'src/enum';
 import { BaseService } from 'src/services/base.service';
 import { mimeTypes } from 'src/utils/mime-types';
+
+const TUS_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 interface TusUploadMetadata {
   filename: string;
@@ -34,6 +37,7 @@ interface Upload {
 
 type TusServer = {
   handle: (req: Request, res: Response) => Promise<void>;
+  cleanUpExpiredUploads: () => Promise<number>;
 };
 
 // TUS library types headers as Web API Headers, so we need .get()
@@ -70,7 +74,10 @@ export class TusService extends BaseService implements OnApplicationShutdown {
 
     this.tusServer = new Server({
       path: '/api/upload',
-      datastore: new FileStore({ directory: uploadPath }),
+      datastore: new FileStore({
+        directory: uploadPath,
+        expirationPeriodInMilliseconds: TUS_EXPIRATION_MS,
+      }),
       relativeLocation: true,
       getFileIdFromRequest: (req) => {
         const url = req.url?.split('?')[0] || '';
@@ -190,10 +197,18 @@ export class TusService extends BaseService implements OnApplicationShutdown {
 
   async onApplicationShutdown() {
     this.logger.log('Shutting down TUS service and cleaning up resources');
-    // The tus server will automatically clean up incomplete uploads
-    // We just need to reset our state
     this.tusServer = null;
     this.initPromise = null;
+  }
+
+  @OnJob({ name: JobName.TusUploadCleanup, queue: QueueName.BackgroundTask })
+  async handleUploadCleanup(): Promise<JobStatus> {
+    const server = await this.initializeTusServer();
+    const deletedCount = await server.cleanUpExpiredUploads();
+    if (deletedCount > 0) {
+      this.logger.log(`Cleaned up ${deletedCount} expired TUS uploads`);
+    }
+    return JobStatus.Success;
   }
 
   /**

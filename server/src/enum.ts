@@ -622,6 +622,8 @@ export enum JobName {
 
   SessionCleanup = 'SessionCleanup',
 
+  TusUploadCleanup = 'TusUploadCleanup',
+
   SendMail = 'SendMail',
 
   SidecarQueueAll = 'SidecarQueueAll',
