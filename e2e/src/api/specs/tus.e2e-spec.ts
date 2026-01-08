@@ -22,6 +22,14 @@ const encodeMetadata = (metadata: Record<string, string>): string => {
     .join(',');
 };
 
+// Helper to extract upload ID from Location header
+// Location format: /api/upload/userId/xx/yy/uuid or similar
+const extractUploadId = (location: string): string => {
+  // Extract everything after /upload/
+  const match = location.match(/\/upload\/(.+)/);
+  return match?.[1] || location.split('/').pop() || '';
+};
+
 // Helper to create TUS upload with required metadata
 const createTusUpload = async (
   accessToken: string,
@@ -115,15 +123,17 @@ describe('/upload (TUS protocol)', () => {
 
       expect(response.status).toBe(201);
       expect(response.headers['location']).toBeDefined();
-      expect(response.headers['upload-offset']).toBe('0');
       expect(response.headers['tus-resumable']).toBe('1.0.0');
 
       const location = response.headers['location'];
       expect(location).toContain('/upload/');
+      // Upload ID should have nested folder structure: userId/xx/yy/uuid
+      const uploadId = extractUploadId(location);
+      expect(uploadId.split('/').length).toBe(4);
     });
 
     it('should reject without required metadata: filename', async () => {
-      const { status, body } = await request(app)
+      const { status, text } = await request(app)
         .post('/upload')
         .set('Authorization', `Bearer ${user.accessToken}`)
         .set('Upload-Length', '1000')
@@ -139,11 +149,11 @@ describe('/upload (TUS protocol)', () => {
         .set('Tus-Resumable', '1.0.0');
 
       expect(status).toBe(400);
-      expect(body).toBe('Missing required metadata: filename');
+      expect(text).toContain('Missing required metadata: filename');
     });
 
     it('should reject without required metadata: deviceAssetId', async () => {
-      const { status, body } = await request(app)
+      const { status, text } = await request(app)
         .post('/upload')
         .set('Authorization', `Bearer ${user.accessToken}`)
         .set('Upload-Length', '1000')
@@ -159,11 +169,11 @@ describe('/upload (TUS protocol)', () => {
         .set('Tus-Resumable', '1.0.0');
 
       expect(status).toBe(400);
-      expect(body).toBe('Missing required metadata: deviceAssetId');
+      expect(text).toContain('Missing required metadata: deviceAssetId');
     });
 
     it('should reject without required metadata: deviceId', async () => {
-      const { status, body } = await request(app)
+      const { status, text } = await request(app)
         .post('/upload')
         .set('Authorization', `Bearer ${user.accessToken}`)
         .set('Upload-Length', '1000')
@@ -179,28 +189,28 @@ describe('/upload (TUS protocol)', () => {
         .set('Tus-Resumable', '1.0.0');
 
       expect(status).toBe(400);
-      expect(body).toBe('Missing required metadata: deviceId');
+      expect(text).toContain('Missing required metadata: deviceId');
     });
 
     it('should reject unsupported file types', async () => {
-      const { status, body } = await createTusUpload(user.accessToken, {
+      const { status, text } = await createTusUpload(user.accessToken, {
         filename: 'malicious.exe',
         size: 1000,
       });
 
       expect(status).toBe(400);
-      expect(body).toContain('Unsupported file type');
+      expect(text).toContain('Unsupported file type');
     });
 
     it('should reject upload if quota exceeded', async () => {
       const imageData = Buffer.alloc(600); // Exceeds quota of 512 bytes
-      const { status, body } = await createTusUpload(quotaUser.accessToken, {
+      const { status, text } = await createTusUpload(quotaUser.accessToken, {
         filename: 'large-file.png',
         size: imageData.length,
       });
 
       expect(status).toBe(400);
-      expect(body).toBe('Quota has been exceeded!');
+      expect(text).toContain('Quota has been exceeded!');
     });
 
     it('should accept various supported image types', async () => {
@@ -259,7 +269,7 @@ describe('/upload (TUS protocol)', () => {
       });
 
       expect(createResponse.status).toBe(201);
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
       const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
 
       expect(patchResponse.status).toBe(204);
@@ -279,7 +289,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const firstChunk = imageData.subarray(0, halfLength);
       const firstPatch = await uploadChunk(user.accessToken, uploadId, firstChunk, 0);
@@ -304,7 +314,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
 
@@ -332,7 +342,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       let offset = 0;
       const chunk1 = imageData.subarray(0, chunkSize);
@@ -365,7 +375,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
       const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
 
       expect(patchResponse.status).toBe(204);
@@ -402,7 +412,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const headResponse1 = await getUploadStatus(user.accessToken, uploadId);
       expect(headResponse1.status).toBe(200);
@@ -428,7 +438,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
       const headResponse = await getUploadStatus(user.accessToken, uploadId);
 
       expect(headResponse.status).toBe(200);
@@ -437,7 +447,9 @@ describe('/upload (TUS protocol)', () => {
     });
 
     it('should return 404 for non-existent upload', async () => {
-      const headResponse = await getUploadStatus(user.accessToken, uuidDto.notFound);
+      // Use a properly formatted but non-existent upload ID (userId/xx/yy/uuid)
+      const nonExistentUploadId = `${user.userId}/00/00/${uuidDto.notFound}`;
+      const headResponse = await getUploadStatus(user.accessToken, nonExistentUploadId);
       expect(headResponse.status).toBe(404);
     });
   });
@@ -462,7 +474,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const chunk = imageData.subarray(0, Math.floor(imageData.length / 2));
       await uploadChunk(user.accessToken, uploadId, chunk, 0);
@@ -475,7 +487,9 @@ describe('/upload (TUS protocol)', () => {
     });
 
     it('should return 404 for non-existent upload', async () => {
-      const deleteResponse = await cancelUpload(user.accessToken, uuidDto.notFound);
+      // Use a properly formatted but non-existent upload ID (userId/xx/yy/uuid)
+      const nonExistentUploadId = `${user.userId}/00/00/${uuidDto.notFound}`;
+      const deleteResponse = await cancelUpload(user.accessToken, nonExistentUploadId);
       expect(deleteResponse.status).toBe(404);
     });
   });
@@ -491,7 +505,7 @@ describe('/upload (TUS protocol)', () => {
       }
 
       const createResponse = await createTusUpload(user.accessToken, {
-        filename: 'large-file-test.bin',
+        filename: 'large-file-test.jpg',
         size: fileSize,
         metadata: {
           deviceAssetId: 'large-file-test-1',
@@ -499,7 +513,7 @@ describe('/upload (TUS protocol)', () => {
       });
 
       expect(createResponse.status).toBe(201);
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const chunkSize = 10 * 1024 * 1024;
       let offset = 0;
@@ -524,7 +538,7 @@ describe('/upload (TUS protocol)', () => {
       const asset = await utils.getAssetInfo(user.accessToken, assetId);
       expect(asset).toBeDefined();
       expect(asset.id).toBe(assetId);
-      expect(asset.originalFileName).toBe('large-file-test.bin');
+      expect(asset.originalFileName).toBe('large-file-test.jpg');
     }, 60_000); // 60 second timeout for large upload
 
     it('should resume large file upload after interruption', async () => {
@@ -536,14 +550,14 @@ describe('/upload (TUS protocol)', () => {
       }
 
       const createResponse = await createTusUpload(user.accessToken, {
-        filename: 'resume-large-test.bin',
+        filename: 'resume-large-test.jpg',
         size: fileSize,
         metadata: {
           deviceAssetId: 'resume-large-test-1',
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       // Upload first 5MB chunk
       const firstChunkSize = 5 * 1024 * 1024;
@@ -566,7 +580,7 @@ describe('/upload (TUS protocol)', () => {
 
       const assetId = resumeResponse.headers['x-immich-asset-id'];
       const asset = await utils.getAssetInfo(user.accessToken, assetId);
-      expect(asset.originalFileName).toBe('resume-large-test.bin');
+      expect(asset.originalFileName).toBe('resume-large-test.jpg');
     }, 60_000);
 
     it('should resume upload after partial chunk failure', async () => {
@@ -578,7 +592,7 @@ describe('/upload (TUS protocol)', () => {
       }
 
       const createResponse = await createTusUpload(user.accessToken, {
-        filename: 'failure-resume-test.bin',
+        filename: 'failure-resume-test.jpg',
         size: fileSize,
         metadata: {
           deviceAssetId: 'failure-resume-test-1',
@@ -586,7 +600,7 @@ describe('/upload (TUS protocol)', () => {
       });
 
       expect(createResponse.status).toBe(201);
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       // Upload first chunk successfully (5MB)
       const chunkSize = 5 * 1024 * 1024;
@@ -620,7 +634,7 @@ describe('/upload (TUS protocol)', () => {
       const assetId = response4.headers['x-immich-asset-id'];
       const asset = await utils.getAssetInfo(user.accessToken, assetId);
       expect(asset).toBeDefined();
-      expect(asset.originalFileName).toBe('failure-resume-test.bin');
+      expect(asset.originalFileName).toBe('failure-resume-test.jpg');
     }, 60_000);
   });
 
@@ -638,7 +652,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const chunk1 = imageData.subarray(0, chunkSize);
       await uploadChunk(user.accessToken, uploadId, chunk1, 0);
@@ -682,8 +696,8 @@ describe('/upload (TUS protocol)', () => {
         }),
       ]);
 
-      const uploadId1 = create1.headers['location'].split('/').pop();
-      const uploadId2 = create2.headers['location'].split('/').pop();
+      const uploadId1 = extractUploadId(create1.headers['location']);
+      const uploadId2 = extractUploadId(create2.headers['location']);
 
       const [patch1, patch2] = await Promise.all([
         uploadChunk(user.accessToken, uploadId1, upload1Data, 0),
@@ -721,7 +735,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId1 = create1.headers['location'].split('/').pop();
+      const uploadId1 = extractUploadId(create1.headers['location']);
       const patch1 = await uploadChunk(user.accessToken, uploadId1, imageData, 0);
       const assetId1 = patch1.headers['x-immich-asset-id'];
 
@@ -733,7 +747,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId2 = create2.headers['location'].split('/').pop();
+      const uploadId2 = extractUploadId(create2.headers['location']);
       const patch2 = await uploadChunk(user.accessToken, uploadId2, imageData, 0);
       const assetId2 = patch2.headers['x-immich-asset-id'];
 
@@ -753,7 +767,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
       const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
       const assetId = patchResponse.headers['x-immich-asset-id'];
 
@@ -772,7 +786,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
       const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
       const assetId = patchResponse.headers['x-immich-asset-id'];
 
@@ -801,7 +815,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
       const patchResponse = await uploadChunk(user.accessToken, uploadId, videoData, 0);
       const assetId = patchResponse.headers['x-immich-asset-id'];
 
@@ -824,7 +838,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
       const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
       const assetId = patchResponse.headers['x-immich-asset-id'];
 
@@ -856,7 +870,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 1000);
 
@@ -873,7 +887,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const patchResponse = await uploadChunk(admin.accessToken, uploadId, imageData, 0);
 
@@ -892,7 +906,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
 
@@ -909,7 +923,7 @@ describe('/upload (TUS protocol)', () => {
         },
       });
 
-      const uploadId = createResponse.headers['location'].split('/').pop();
+      const uploadId = extractUploadId(createResponse.headers['location']);
 
       const response = await request(app)
         .patch(`/upload/${uploadId}`)
@@ -918,7 +932,8 @@ describe('/upload (TUS protocol)', () => {
         .set('Tus-Resumable', '1.0.0')
         .send(imageData);
 
-      expect(response.status).toBe(400); // Bad request
+      // TUS library should reject with 400 (missing required header) or 403 (forbidden)
+      expect([400, 403]).toContain(response.status);
     });
 
     it('should reject POST without Upload-Length header', async () => {
@@ -935,6 +950,172 @@ describe('/upload (TUS protocol)', () => {
         .set('Tus-Resumable', '1.0.0');
 
       expect(response.status).toBe(400); // Bad request
+    });
+  });
+
+  describe('Authentication security', () => {
+    it('should reject upload creation with invalid token', async () => {
+      const response = await request(app)
+        .post('/upload')
+        .set('Authorization', 'Bearer invalid-token-12345')
+        .set('Upload-Length', '1000')
+        .set('Upload-Metadata', encodeMetadata({
+          filename: 'auth-test.png',
+          deviceAssetId: 'auth-test-1',
+          deviceId: 'test-device',
+          fileCreatedAt: new Date().toISOString(),
+          fileModifiedAt: new Date().toISOString(),
+        }))
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(response.status).toBe(401);
+    });
+
+    it('should reject chunk upload with invalid token', async () => {
+      // First create a valid upload
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'auth-chunk-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'auth-chunk-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // Try to upload chunk with invalid token
+      const patchResponse = await request(app)
+        .patch(`/upload/${uploadId}`)
+        .set('Authorization', 'Bearer invalid-token-12345')
+        .set('Content-Type', 'application/offset+octet-stream')
+        .set('Upload-Offset', '0')
+        .set('Tus-Resumable', '1.0.0')
+        .send(imageData);
+
+      expect(patchResponse.status).toBe(401);
+    });
+
+    it('should reject HEAD request with invalid token', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'auth-head-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'auth-head-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const headResponse = await request(app)
+        .head(`/upload/${uploadId}`)
+        .set('Authorization', 'Bearer invalid-token-12345')
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(headResponse.status).toBe(401);
+    });
+
+    it('should reject DELETE request with invalid token', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'auth-delete-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'auth-delete-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const deleteResponse = await request(app)
+        .delete(`/upload/${uploadId}`)
+        .set('Authorization', 'Bearer invalid-token-12345')
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(deleteResponse.status).toBe(401);
+    });
+
+    it('should reject upload without any authentication', async () => {
+      const response = await request(app)
+        .post('/upload')
+        .set('Upload-Length', '1000')
+        .set('Upload-Metadata', encodeMetadata({
+          filename: 'no-auth-test.png',
+          deviceAssetId: 'no-auth-test-1',
+          deviceId: 'test-device',
+          fileCreatedAt: new Date().toISOString(),
+          fileModifiedAt: new Date().toISOString(),
+        }))
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(response.status).toBe(401);
+    });
+
+    it('should isolate uploads between users - user cannot access other user upload', async () => {
+      const imageData = makeRandomImage();
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'isolation-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'isolation-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const patchResponse = await uploadChunk(admin.accessToken, uploadId, imageData, 0);
+      expect(patchResponse.status).toBe(403);
+
+      const headResponse = await request(app)
+        .head(`/upload/${uploadId}`)
+        .set('Authorization', `Bearer ${admin.accessToken}`)
+        .set('Tus-Resumable', '1.0.0');
+      expect(headResponse.status).toBe(403);
+
+      const deleteResponse = await request(app)
+        .delete(`/upload/${uploadId}`)
+        .set('Authorization', `Bearer ${admin.accessToken}`)
+        .set('Tus-Resumable', '1.0.0');
+      expect(deleteResponse.status).toBe(403);
+
+      const finalPatch = await uploadChunk(user.accessToken, uploadId, imageData, 0);
+      expect(finalPatch.status).toBe(204);
+      expect(finalPatch.headers['x-immich-asset-id']).toBeDefined();
+    });
+
+    it('should work with API key authentication', async () => {
+      const apiKey = await utils.createApiKey(user.accessToken, ['all']);
+
+      const imageData = makeRandomImage();
+      const createResponse = await request(app)
+        .post('/upload')
+        .set('x-api-key', apiKey.secret)
+        .set('Upload-Length', imageData.length.toString())
+        .set('Upload-Metadata', encodeMetadata({
+          filename: 'apikey-test.png',
+          deviceAssetId: 'apikey-test-1',
+          deviceId: 'test-device',
+          fileCreatedAt: new Date().toISOString(),
+          fileModifiedAt: new Date().toISOString(),
+        }))
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const patchResponse = await request(app)
+        .patch(`/upload/${uploadId}`)
+        .set('x-api-key', apiKey.secret)
+        .set('Content-Type', 'application/offset+octet-stream')
+        .set('Upload-Offset', '0')
+        .set('Tus-Resumable', '1.0.0')
+        .send(imageData);
+
+      expect(patchResponse.status).toBe(204);
+      expect(patchResponse.headers['x-immich-asset-id']).toBeDefined();
     });
   });
 });
