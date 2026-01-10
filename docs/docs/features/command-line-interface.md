@@ -106,6 +106,7 @@ Options:
   --delete-duplicates         Delete local assets that are duplicates (already exist on server) (env: IMMICH_DELETE_DUPLICATES)
   --no-progress               Hide progress bars (env: IMMICH_PROGRESS_BAR)
   --watch                     Watch for changes and upload automatically (default: false, env: IMMICH_WATCH_CHANGES)
+  --resumable                 Use resumable uploads for large files >10MB (default: false, env: IMMICH_RESUMABLE_UPLOAD)
   --help                      display help for command
 ```
 
@@ -175,6 +176,32 @@ By default, hidden files are skipped. If you want to include hidden files, use t
 ```bash
 immich upload --include-hidden --recursive directory/
 ```
+
+### Resumable Uploads
+
+For large files or unreliable network connections, you can use the `--resumable` option to enable resumable uploads. This uses the [TUS protocol](/features/resumable-uploads) to allow interrupted uploads to be resumed from where they left off:
+
+```bash
+immich upload --resumable --recursive directory/
+```
+
+This is particularly useful when:
+
+- Uploading large video files (100MB+)
+- Using unstable or slow network connections
+- Running long uploads that may be interrupted
+- Uploading through a reverse proxy with request size limits (e.g., nginx, Cloudflare)
+
+Files are uploaded in 10MB chunks, and the server tracks progress. If an upload is interrupted, the next attempt will resume from the last successful chunk rather than starting over.
+
+You can also enable resumable uploads via environment variable:
+
+```bash
+export IMMICH_RESUMABLE_UPLOAD=true
+immich upload --recursive directory/
+```
+
+See [Resumable Uploads](/features/resumable-uploads) for more details on how this feature works.
 
 You can use the `--json-output` option to get a json printed which includes
 three keys: `newFiles`, `duplicates` and `newAssets`. Due to some logging

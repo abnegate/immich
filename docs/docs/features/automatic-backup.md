@@ -1,6 +1,6 @@
 # Automatic Backup
 
-Immich supports uploading photos and videos from your mobile device to the server automatically.
+Immich supports uploading photos and videos from your mobile device to the server automatically. The mobile app uses [resumable uploads](/features/resumable-uploads) to ensure reliable transfers even over unstable network connections.
 
 ---
 
@@ -26,6 +26,16 @@ If background backup is enabled. The app will periodically check if there are an
 
 - The app must be in the background for the backup worker to start running.
 - If you reopen the app and the first page you see is the backup page, the counts will not reflect the background uploaded result. You have to navigate out of the page and come back to see the updated counts.
+
+#### Resumable Uploads
+
+Both foreground and background backups use [resumable uploads](/features/resumable-uploads), which means:
+
+- Large files are uploaded in chunks (10MB each)
+- If the connection drops, uploads resume from where they left off
+- No need to re-upload files that were partially transferred
+
+This is especially useful for uploading large videos over mobile connections.
 
 #### Android
 
