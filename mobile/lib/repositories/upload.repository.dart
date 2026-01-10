@@ -124,11 +124,22 @@ class UploadRepository {
             livePhotoVideoId: candidate.task.fields['livePhotoVideoId'],
           );
 
+          // Emit running status when upload starts
+          onUploadStatus?.call(TaskStatusUpdate(
+            candidate.task,
+            TaskStatus.running,
+          ));
+
           final result = await nativeTusRepository.uploadFile(
             candidate.file,
             metadata,
             onProgress: (bytesUploaded, totalBytes) {
               logger.fine('Native tus upload progress: $bytesUploaded / $totalBytes');
+              onTaskProgress?.call(TaskProgressUpdate(
+                candidate.task,
+                bytesUploaded / totalBytes,
+                totalBytes,
+              ));
             },
           );
 
