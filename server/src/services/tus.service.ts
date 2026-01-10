@@ -97,6 +97,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       onIncomingRequest: async (req, uploadId) => {
         const userId = getHeader(req.headers, 'x-immich-user-id');
         if (!userId) {
+          self.logger.warn('TUS request rejected: missing x-immich-user-id header');
           throw self.toTusError(401, 'Unauthorized');
         }
 
@@ -116,24 +117,30 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       onUploadCreate: async (req, upload) => {
         const userId = getHeader(req.headers, 'x-immich-user-id');
         if (!userId) {
+          self.logger.warn('TUS upload rejected: missing x-immich-user-id header');
           throw self.toTusError(401, 'Unauthorized');
         }
 
         // Validate required metadata
         const metadata = self.parseMetadata(upload.metadata);
+
         if (!metadata.filename) {
+          self.logger.warn('TUS upload rejected: missing filename metadata');
           throw self.toTusError(400, 'Missing required metadata: filename');
         }
         if (!metadata.deviceAssetId) {
+          self.logger.warn('TUS upload rejected: missing deviceAssetId metadata');
           throw self.toTusError(400, 'Missing required metadata: deviceAssetId');
         }
         if (!metadata.deviceId) {
+          self.logger.warn('TUS upload rejected: missing deviceId metadata');
           throw self.toTusError(400, 'Missing required metadata: deviceId');
         }
 
         // Validate file type
         const filename = metadata.filename.toLowerCase();
         if (!mimeTypes.isAsset(filename)) {
+          self.logger.warn(`TUS upload rejected: unsupported file type ${filename}`);
           throw self.toTusError(400, `Unsupported file type: ${filename}`);
         }
 
@@ -142,10 +149,10 @@ export class TusService extends BaseService implements OnApplicationShutdown {
         const quotaUsage = getHeader(req.headers, 'x-immich-quota-usage');
         const uploadSize = upload.size || 0;
         if (quotaSize && Number(quotaSize) < Number(quotaUsage) + uploadSize) {
+          self.logger.warn('TUS upload rejected: quota exceeded');
           throw self.toTusError(400, 'Quota has been exceeded!');
         }
 
-        self.logger.log(`Upload created: ${upload.id} for user ${userId}`);
         return {};
       },
       onUploadFinish: async (req, upload) => {
@@ -192,7 +199,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     req.headers['x-immich-quota-usage'] = String(auth.user.quotaUsageInBytes ?? 0);
 
     const server = await this.initializeTusServer();
-    return server.handle(req, res);
+    await server.handle(req, res);
   }
 
   async onApplicationShutdown() {
