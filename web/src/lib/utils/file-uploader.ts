@@ -42,8 +42,8 @@ export const addDummyItems = () => {
 
 // addDummyItems();
 
-// Threshold for using resumable uploads (10 MB) - matches mobile and CLI
-const RESUMABLE_UPLOAD_THRESHOLD = 10 * 1024 * 1024;
+// Threshold for using resumable uploads (50 MB) - matches mobile and CLI
+const RESUMABLE_UPLOAD_THRESHOLD = 50 * 1024 * 1024;
 
 export const uploadExecutionQueue = new ExecutorQueue({ concurrency: 2 });
 
@@ -159,7 +159,7 @@ async function uploadFileResumable(
     const upload = new tus.Upload(assetFile, {
       endpoint: `${baseUrl}/upload${queryParams ? `?${queryParams}` : ''}`,
       metadata,
-      chunkSize: 10 * 1024 * 1024, // 10MB chunks
+      chunkSize: 50 * 1024 * 1024, // 50MB chunks
       removeFingerprintOnSuccess: true,
       // Store upload URL in localStorage to enable resuming
       storeFingerprintForResuming: true,

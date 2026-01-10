@@ -150,12 +150,14 @@ describe('file-uploader', () => {
   });
 
   describe('RESUMABLE_UPLOAD_THRESHOLD', () => {
-    it('should be 10MB (verified through file size comparison)', () => {
+    it('should be 50MB (verified through file size comparison)', () => {
       const smallFile = new File(['x'.repeat(1024)], 'small.jpg', { type: 'image/jpeg' });
-      const largeFile = new File(['x'.repeat(10 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
+      const mediumFile = new File(['x'.repeat(25 * 1024 * 1024)], 'medium.jpg', { type: 'image/jpeg' });
+      const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
 
-      expect(smallFile.size).toBeLessThan(10 * 1024 * 1024);
-      expect(largeFile.size).toBeGreaterThan(10 * 1024 * 1024);
+      expect(smallFile.size).toBeLessThan(50 * 1024 * 1024);
+      expect(mediumFile.size).toBeLessThan(50 * 1024 * 1024);
+      expect(largeFile.size).toBeGreaterThan(50 * 1024 * 1024);
     });
   });
 
@@ -246,9 +248,9 @@ describe('file-uploader', () => {
     });
   });
 
-  describe('resumable upload (tus)', () => {
-    it('should use tus for files larger than 10MB', async () => {
-      const largeFile = new File(['x'.repeat(10 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
+  describe('resumable upload (tus) - files over 50MB', () => {
+    it('should use tus for files larger than 50MB', async () => {
+      const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
 
       const promise = fileUploadHandler({ files: [largeFile] });
 
@@ -259,7 +261,7 @@ describe('file-uploader', () => {
     });
 
     it('should set correct tus metadata', async () => {
-      const largeFile = new File(['x'.repeat(10 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
+      const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
       Object.defineProperty(largeFile, 'lastModified', { value: 1234567890 });
 
       await fileUploadHandler({ files: [largeFile] });
@@ -274,7 +276,7 @@ describe('file-uploader', () => {
     });
 
     it('should set visibility to locked for locked assets', async () => {
-      const largeFile = new File(['x'.repeat(10 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
+      const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
 
       await fileUploadHandler({ files: [largeFile], isLockedAssets: true });
 
@@ -283,18 +285,18 @@ describe('file-uploader', () => {
       expect(options.metadata.visibility).toBe(AssetVisibility.Locked);
     });
 
-    it('should use 10MB chunk size', async () => {
-      const largeFile = new File(['x'.repeat(10 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
+    it('should use 50MB chunk size', async () => {
+      const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
 
       await fileUploadHandler({ files: [largeFile] });
 
       expect(tusUploadCalls.length).toBeGreaterThan(0);
       const { options } = tusUploadCalls[0];
-      expect(options.chunkSize).toBe(10 * 1024 * 1024);
+      expect(options.chunkSize).toBe(50 * 1024 * 1024);
     });
 
     it('should enable fingerprint storage for resuming', async () => {
-      const largeFile = new File(['x'.repeat(10 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
+      const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
 
       await fileUploadHandler({ files: [largeFile] });
 
@@ -305,7 +307,7 @@ describe('file-uploader', () => {
     });
 
     it('should check for previous uploads to resume', async () => {
-      const largeFile = new File(['x'.repeat(10 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
+      const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
 
       await fileUploadHandler({ files: [largeFile] });
 
@@ -317,7 +319,7 @@ describe('file-uploader', () => {
       const previousUpload = { uploadUrl: 'http://localhost/upload/previous-id' };
       setFindPreviousUploadsResult([previousUpload]);
 
-      const largeFile = new File(['x'.repeat(10 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
+      const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
 
       await fileUploadHandler({ files: [largeFile] });
 
@@ -326,7 +328,7 @@ describe('file-uploader', () => {
     });
 
     it('should start upload after checking for previous uploads', async () => {
-      const largeFile = new File(['x'.repeat(10 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
+      const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
 
       await fileUploadHandler({ files: [largeFile] });
 
@@ -335,13 +337,31 @@ describe('file-uploader', () => {
     });
   });
 
-  describe('multipart upload (small files)', () => {
-    it('should not use tus for files smaller than 10MB', async () => {
+  describe('multipart upload (files under 50MB)', () => {
+    it('should not use tus for files smaller than 50MB', async () => {
       const smallFile = new File(['test content'], 'small.jpg', { type: 'image/jpeg' });
 
       await fileUploadHandler({ files: [smallFile] });
 
       // tus should NOT be used for small files
+      expect(tusUploadCalls.length).toBe(0);
+    });
+
+    it('should not use tus for 25MB file (under 50MB threshold)', async () => {
+      const mediumFile = new File(['x'.repeat(25 * 1024 * 1024)], 'medium.jpg', { type: 'image/jpeg' });
+
+      await fileUploadHandler({ files: [mediumFile] });
+
+      // tus should NOT be used for files under 50MB
+      expect(tusUploadCalls.length).toBe(0);
+    });
+
+    it('should not use tus for file just under 50MB threshold', async () => {
+      const justUnderFile = new File(['x'.repeat(50 * 1024 * 1024 - 1)], 'just-under.jpg', { type: 'image/jpeg' });
+
+      await fileUploadHandler({ files: [justUnderFile] });
+
+      // tus should NOT be used for files under 50MB
       expect(tusUploadCalls.length).toBe(0);
     });
   });
