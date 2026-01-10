@@ -40,9 +40,10 @@ export function getThumbnailSize(assetCount: number, viewWidth: number): number 
 
 export const getAltText = derived(t, ($t) => {
   return (asset: TimelineAsset) => {
-    const date = fromTimelinePlainDateTime(asset.localDateTime).toJSDate().toLocaleString(get(locale), {
-      dateStyle: 'long',
-      timeZone: 'UTC',
+    const date = fromTimelinePlainDateTime(asset.localDateTime).toLocaleString({
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
     });
     const hasPlace = asset.city && asset.country;
 

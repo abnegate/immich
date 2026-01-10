@@ -73,7 +73,7 @@ export const toResponseDto = (...timelineAsset: TimelineAsset[]) => {
     thumbhash: [],
   };
   for (const asset of timelineAsset) {
-    const fileCreatedAt = fromTimelinePlainDateTime(asset.fileCreatedAt).toISO();
+    const fileCreatedAt = fromTimelinePlainDateTime(asset.fileCreatedAt).setZone('utc', { keepLocalTime: true }).toISO();
     bucketAssets.city.push(asset.city);
     bucketAssets.country.push(asset.country);
     bucketAssets.duration.push(asset.duration!);
@@ -84,6 +84,7 @@ export const toResponseDto = (...timelineAsset: TimelineAsset[]) => {
     bucketAssets.isTrashed.push(asset.isTrashed);
     bucketAssets.livePhotoVideoId.push(asset.livePhotoVideoId!);
     bucketAssets.fileCreatedAt.push(fileCreatedAt);
+    bucketAssets.localOffsetHours.push(0);
     bucketAssets.ownerId.push(asset.ownerId);
     bucketAssets.projectionType.push(asset.projectionType!);
     bucketAssets.ratio.push(asset.ratio);
