@@ -15,6 +15,9 @@ import { app, testAssetDir, utils } from 'src/utils';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+// Standard chunk size used by clients (50MB)
+const CHUNK_SIZE = 50 * 1024 * 1024;
+
 // Helper to encode metadata in base64 as required by TUS protocol
 const encodeMetadata = (metadata: Record<string, string>): string => {
   return Object.entries(metadata)
@@ -494,10 +497,76 @@ describe('/upload (TUS protocol)', () => {
     });
   });
 
-  describe('Large file uploads', () => {
-    it('should handle large file upload with multiple 10MB chunks', async () => {
-      // Create a 25MB buffer to test chunked upload behavior (exceeds 10MB threshold)
-      const fileSize = 25 * 1024 * 1024;
+  describe('Small file uploads (under 50MB - single request)', () => {
+    it('should upload small file in a single request', async () => {
+      // Create a 10MB buffer (well under 50MB threshold)
+      const fileSize = 10 * 1024 * 1024;
+      const smallData = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        smallData[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'small-file-test.jpg',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'small-file-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // Upload entire file in single request (no chunking needed)
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, smallData, 0);
+
+      expect(patchResponse.status).toBe(204);
+      expect(patchResponse.headers['upload-offset']).toBe(fileSize.toString());
+      expect(patchResponse.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.originalFileName).toBe('small-file-test.jpg');
+    }, 30_000);
+
+    it('should upload file just under 50MB threshold in single request', async () => {
+      // Create a 49MB buffer (just under 50MB threshold)
+      const fileSize = 49 * 1024 * 1024;
+      const data = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        data[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'under-threshold-test.jpg',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'under-threshold-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // Upload entire file in single request
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, data, 0);
+
+      expect(patchResponse.status).toBe(204);
+      expect(patchResponse.headers['upload-offset']).toBe(fileSize.toString());
+      expect(patchResponse.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.originalFileName).toBe('under-threshold-test.jpg');
+    }, 60_000);
+  });
+
+  describe('Large file uploads (over 50MB - chunked)', () => {
+    it('should handle large file upload with multiple 50MB chunks', async () => {
+      // Create a 120MB buffer to test chunked upload behavior (exceeds 50MB threshold)
+      const fileSize = 120 * 1024 * 1024;
       const largeData = Buffer.alloc(fileSize);
       // Fill with random-ish data to avoid compression issues
       for (let i = 0; i < fileSize; i += 1024) {
@@ -515,12 +584,12 @@ describe('/upload (TUS protocol)', () => {
       expect(createResponse.status).toBe(201);
       const uploadId = extractUploadId(createResponse.headers['location']);
 
-      const chunkSize = 10 * 1024 * 1024;
       let offset = 0;
       let lastResponse;
+      let chunkCount = 0;
 
       while (offset < fileSize) {
-        const end = Math.min(offset + chunkSize, fileSize);
+        const end = Math.min(offset + CHUNK_SIZE, fileSize);
         const chunk = largeData.subarray(offset, end);
 
         lastResponse = await uploadChunk(user.accessToken, uploadId, chunk, offset);
@@ -528,7 +597,11 @@ describe('/upload (TUS protocol)', () => {
         expect(lastResponse.headers['upload-offset']).toBe(end.toString());
 
         offset = end;
+        chunkCount++;
       }
+
+      // Verify we actually used multiple chunks (120MB / 50MB = 3 chunks)
+      expect(chunkCount).toBe(3);
 
       // Verify upload completed successfully
       expect(lastResponse!.headers['x-immich-asset-id']).toBeDefined();
@@ -539,11 +612,51 @@ describe('/upload (TUS protocol)', () => {
       expect(asset).toBeDefined();
       expect(asset.id).toBe(assetId);
       expect(asset.originalFileName).toBe('large-file-test.jpg');
-    }, 60_000); // 60 second timeout for large upload
+    }, 120_000); // 120 second timeout for large upload
+
+    it('should handle file just over 50MB threshold with 2 chunks', async () => {
+      // Create a 75MB buffer (just over 50MB, requires 2 chunks)
+      const fileSize = 75 * 1024 * 1024;
+      const data = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        data[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'over-threshold-test.jpg',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'over-threshold-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // First chunk: 50MB
+      const chunk1 = data.subarray(0, CHUNK_SIZE);
+      const response1 = await uploadChunk(user.accessToken, uploadId, chunk1, 0);
+      expect(response1.status).toBe(204);
+      expect(response1.headers['upload-offset']).toBe(CHUNK_SIZE.toString());
+      // Should not have asset ID yet (upload not complete)
+      expect(response1.headers['x-immich-asset-id']).toBeUndefined();
+
+      // Second chunk: remaining 25MB
+      const chunk2 = data.subarray(CHUNK_SIZE);
+      const response2 = await uploadChunk(user.accessToken, uploadId, chunk2, CHUNK_SIZE);
+      expect(response2.status).toBe(204);
+      expect(response2.headers['upload-offset']).toBe(fileSize.toString());
+      expect(response2.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = response2.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.originalFileName).toBe('over-threshold-test.jpg');
+    }, 90_000);
 
     it('should resume large file upload after interruption', async () => {
-      // Create a 15MB buffer
-      const fileSize = 15 * 1024 * 1024;
+      // Create a 100MB buffer
+      const fileSize = 100 * 1024 * 1024;
       const largeData = Buffer.alloc(fileSize);
       for (let i = 0; i < fileSize; i += 1024) {
         largeData[i] = i % 256;
@@ -559,15 +672,14 @@ describe('/upload (TUS protocol)', () => {
 
       const uploadId = extractUploadId(createResponse.headers['location']);
 
-      // Upload first 5MB chunk
-      const firstChunkSize = 5 * 1024 * 1024;
-      const firstChunk = largeData.subarray(0, firstChunkSize);
+      // Upload first 50MB chunk
+      const firstChunk = largeData.subarray(0, CHUNK_SIZE);
       await uploadChunk(user.accessToken, uploadId, firstChunk, 0);
 
       // Simulate "interruption" - check status via HEAD
       const statusResponse = await getUploadStatus(user.accessToken, uploadId);
       expect(statusResponse.status).toBe(200);
-      expect(statusResponse.headers['upload-offset']).toBe(firstChunkSize.toString());
+      expect(statusResponse.headers['upload-offset']).toBe(CHUNK_SIZE.toString());
 
       // Resume upload from where we left off
       const offset = Number.parseInt(statusResponse.headers['upload-offset']);
@@ -581,11 +693,11 @@ describe('/upload (TUS protocol)', () => {
       const assetId = resumeResponse.headers['x-immich-asset-id'];
       const asset = await utils.getAssetInfo(user.accessToken, assetId);
       expect(asset.originalFileName).toBe('resume-large-test.jpg');
-    }, 60_000);
+    }, 90_000);
 
     it('should resume upload after partial chunk failure', async () => {
-      // Create a 20MB buffer
-      const fileSize = 20 * 1024 * 1024;
+      // Create a 150MB buffer (3 full chunks)
+      const fileSize = 150 * 1024 * 1024;
       const largeData = Buffer.alloc(fileSize);
       for (let i = 0; i < fileSize; i += 1024) {
         largeData[i] = i % 256;
@@ -602,40 +714,34 @@ describe('/upload (TUS protocol)', () => {
       expect(createResponse.status).toBe(201);
       const uploadId = extractUploadId(createResponse.headers['location']);
 
-      // Upload first chunk successfully (5MB)
-      const chunkSize = 5 * 1024 * 1024;
-      const chunk1 = largeData.subarray(0, chunkSize);
+      // Upload first chunk successfully (50MB)
+      const chunk1 = largeData.subarray(0, CHUNK_SIZE);
       const response1 = await uploadChunk(user.accessToken, uploadId, chunk1, 0);
       expect(response1.status).toBe(204);
 
-      // Upload second chunk successfully (5MB)
-      const chunk2 = largeData.subarray(chunkSize, chunkSize * 2);
-      const response2 = await uploadChunk(user.accessToken, uploadId, chunk2, chunkSize);
+      // Upload second chunk successfully (50MB)
+      const chunk2 = largeData.subarray(CHUNK_SIZE, CHUNK_SIZE * 2);
+      const response2 = await uploadChunk(user.accessToken, uploadId, chunk2, CHUNK_SIZE);
       expect(response2.status).toBe(204);
 
       // Simulate failure recovery: check status via HEAD to get current offset
       const statusAfterPartial = await getUploadStatus(user.accessToken, uploadId);
       expect(statusAfterPartial.status).toBe(200);
       const currentOffset = Number.parseInt(statusAfterPartial.headers['upload-offset']);
-      expect(currentOffset).toBe(chunkSize * 2); // Should be at 10MB
+      expect(currentOffset).toBe(CHUNK_SIZE * 2); // Should be at 100MB
 
       // Resume from the correct offset (simulating client recovery after failure)
-      const chunk3 = largeData.subarray(currentOffset, currentOffset + chunkSize);
+      const chunk3 = largeData.subarray(currentOffset);
       const response3 = await uploadChunk(user.accessToken, uploadId, chunk3, currentOffset);
       expect(response3.status).toBe(204);
-
-      // Final chunk
-      const chunk4 = largeData.subarray(currentOffset + chunkSize);
-      const response4 = await uploadChunk(user.accessToken, uploadId, chunk4, currentOffset + chunkSize);
-      expect(response4.status).toBe(204);
-      expect(response4.headers['x-immich-asset-id']).toBeDefined();
+      expect(response3.headers['x-immich-asset-id']).toBeDefined();
 
       // Verify the asset was created correctly
-      const assetId = response4.headers['x-immich-asset-id'];
+      const assetId = response3.headers['x-immich-asset-id'];
       const asset = await utils.getAssetInfo(user.accessToken, assetId);
       expect(asset).toBeDefined();
       expect(asset.originalFileName).toBe('failure-resume-test.jpg');
-    }, 60_000);
+    }, 120_000);
   });
 
   describe('Resumable upload flow', () => {
