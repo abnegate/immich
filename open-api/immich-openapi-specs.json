@@ -16712,6 +16712,7 @@
           "PersonFileMigration",
           "PersonGenerateThumbnail",
           "SessionCleanup",
+          "TusUploadCleanup",
           "SendMail",
           "SidecarQueueAll",
           "SidecarCheck",
