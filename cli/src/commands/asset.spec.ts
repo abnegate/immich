@@ -11,11 +11,41 @@ import { checkForDuplicates, getAlbumName, startWatch, uploadFiles, UploadOption
 
 vi.mock('@immich/sdk');
 vi.mock('tus-js-client', () => ({
-  Upload: vi.fn().mockImplementation(() => ({
-    start: vi.fn(),
-    abort: vi.fn(),
-    url: 'http://example.com/upload/test-upload-id',
-  })),
+  Upload: class MockUpload {
+    private options: any;
+    url = 'http://example.com/upload/test-upload-id';
+
+    constructor(_fileStream: any, options: any) {
+      this.options = options;
+    }
+
+    start() {
+      // Simulate onAfterResponse with asset ID header
+      if (this.options.onAfterResponse) {
+        this.options.onAfterResponse(null, {
+          getHeader: (name: string) => {
+            if (name === 'x-immich-asset-id') return 'test-upload-id';
+            if (name === 'x-immich-duplicate') return 'false';
+            return null;
+          },
+        });
+      }
+      // Simulate successful upload after a tick
+      setTimeout(() => {
+        if (this.options.onSuccess) {
+          this.options.onSuccess();
+        }
+      }, 0);
+    }
+
+    abort() {}
+
+    findPreviousUploads() {
+      return Promise.resolve([]);
+    }
+
+    resumeFromPreviousUpload() {}
+  },
 }));
 
 describe('getAlbumName', () => {
@@ -320,9 +350,11 @@ describe('startWatch', () => {
 describe('uploadFiles with resumable option', () => {
   let testDir: string;
   let testFilePath: string;
+  let mediumTestFilePath: string;
   let largeTestFilePath: string;
-  const smallTestFileData = 'small file data';
-  const largeTestFileData = 'a'.repeat(10 * 1024 * 1024 + 100); // 10MB + 100 bytes (above threshold)
+  const smallTestFileData = 'small file data'; // Few bytes (well under 50MB threshold)
+  const mediumTestFileData = 'a'.repeat(25 * 1024 * 1024); // 25MB (under 50MB threshold - single request)
+  const largeTestFileData = 'a'.repeat(75 * 1024 * 1024); // 75MB (over 50MB threshold - requires chunking)
   const baseUrl = 'http://example.com';
   const apiKey = 'key';
 
@@ -331,9 +363,11 @@ describe('uploadFiles with resumable option', () => {
   beforeEach(() => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-resumable-'));
     testFilePath = path.join(testDir, 'test.png');
+    mediumTestFilePath = path.join(testDir, 'medium-test.png');
     largeTestFilePath = path.join(testDir, 'large-test.png');
 
     fs.writeFileSync(testFilePath, smallTestFileData);
+    fs.writeFileSync(mediumTestFilePath, mediumTestFileData);
     fs.writeFileSync(largeTestFilePath, largeTestFileData);
 
     vi.mocked(defaults).baseUrl = baseUrl;
@@ -348,72 +382,123 @@ describe('uploadFiles with resumable option', () => {
     vi.restoreAllMocks();
   });
 
-  it('should use multipart upload for small files even with resumable flag', async () => {
-    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
-      return {
-        status: 200,
-        body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'created' }),
-      };
+  describe('small files (under 50MB threshold)', () => {
+    it('should use multipart upload for small files even with resumable flag', async () => {
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+        return {
+          status: 200,
+          body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'created' }),
+        };
+      });
+
+      await expect(uploadFiles([testFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
+        {
+          filepath: testFilePath,
+          id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
+        },
+      ]);
     });
 
-    await expect(uploadFiles([testFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
-      {
-        filepath: testFilePath,
-        id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
-      },
-    ]);
-  });
+    it('should use multipart upload for 25MB file (under 50MB threshold)', async () => {
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+        return {
+          status: 200,
+          body: JSON.stringify({ id: 'medium-asset-id', status: 'created' }),
+        };
+      });
 
-  it('should use regular multipart upload when resumable is false', async () => {
-    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
-      return {
-        status: 200,
-        body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'created' }),
-      };
+      await expect(uploadFiles([mediumTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
+        {
+          filepath: mediumTestFilePath,
+          id: 'medium-asset-id',
+        },
+      ]);
     });
 
-    await expect(uploadFiles([testFilePath], { concurrency: 1, resumable: false })).resolves.toEqual([
-      {
-        filepath: testFilePath,
-        id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
-      },
-    ]);
+    it('should use regular multipart upload when resumable is false', async () => {
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+        return {
+          status: 200,
+          body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'created' }),
+        };
+      });
+
+      await expect(uploadFiles([testFilePath], { concurrency: 1, resumable: false })).resolves.toEqual([
+        {
+          filepath: testFilePath,
+          id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
+        },
+      ]);
+    });
   });
 
-  it('should handle upload errors gracefully', async () => {
-    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
-      throw new Error('Network error');
+  describe('large files (over 50MB threshold)', () => {
+    it('should use TUS resumable upload for 75MB file (over 50MB threshold)', async () => {
+      // Large files use TUS protocol via the mocked tus-js-client
+      // The mock returns a URL with test-upload-id
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
+        {
+          filepath: largeTestFilePath,
+          id: 'test-upload-id',
+        },
+      ]);
     });
 
-    await expect(uploadFiles([testFilePath], { concurrency: 1, resumable: false })).resolves.toEqual([]);
+    it('should use multipart for large file when resumable is false', async () => {
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+        return {
+          status: 200,
+          body: JSON.stringify({ id: 'large-multipart-id', status: 'created' }),
+        };
+      });
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: false })).resolves.toEqual([
+        {
+          filepath: largeTestFilePath,
+          id: 'large-multipart-id',
+        },
+      ]);
+    });
   });
 
-  it('should return empty array for empty file list', async () => {
-    await expect(uploadFiles([], { concurrency: 1 })).resolves.toEqual([]);
-  });
+  describe('error handling', () => {
+    it('should handle upload errors gracefully', async () => {
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+        throw new Error('Network error');
+      });
 
-  it('should handle dry run mode', async () => {
-    const result = await uploadFiles([testFilePath], { concurrency: 1, dryRun: true });
-
-    expect(result).toEqual([{ id: '', filepath: testFilePath }]);
-    expect(fetchMocker.mock.calls.length).toBe(0);
-  });
-
-  it('should handle duplicate uploads', async () => {
-    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
-      return {
-        status: 200,
-        body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'duplicate' }),
-      };
+      await expect(uploadFiles([testFilePath], { concurrency: 1, resumable: false })).resolves.toEqual([]);
     });
 
-    const result = await uploadFiles([testFilePath], { concurrency: 1 });
+    it('should return empty array for empty file list', async () => {
+      await expect(uploadFiles([], { concurrency: 1 })).resolves.toEqual([]);
+    });
+  });
 
-    expect(result).toEqual([
-      {
-        filepath: testFilePath,
-        id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
-      },
-    ]);
+  describe('special modes', () => {
+    it('should handle dry run mode', async () => {
+      const result = await uploadFiles([testFilePath], { concurrency: 1, dryRun: true });
+
+      expect(result).toEqual([{ id: '', filepath: testFilePath }]);
+      expect(fetchMocker.mock.calls.length).toBe(0);
+    });
+
+    it('should handle duplicate uploads', async () => {
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+        return {
+          status: 200,
+          body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'duplicate' }),
+        };
+      });
+
+      const result = await uploadFiles([testFilePath], { concurrency: 1 });
+
+      expect(result).toEqual([
+        {
+          filepath: testFilePath,
+          id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
+        },
+      ]);
+    });
   });
 });
