@@ -19,6 +19,7 @@ import 'package:immich_mobile/providers/backup/drift_backup.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/asset.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/storage.provider.dart';
 import 'package:immich_mobile/repositories/asset_media.repository.dart';
+import 'package:immich_mobile/repositories/native_tus_upload.repository.dart';
 import 'package:immich_mobile/repositories/upload.repository.dart';
 import 'package:immich_mobile/services/api.service.dart';
 import 'package:immich_mobile/services/app_settings.service.dart';
@@ -101,26 +102,46 @@ class UploadService {
 
   Future<void> manualBackup(List<LocalAsset> localAssets) async {
     await _storageRepository.clearCache();
-    List<UploadTask> tasks = [];
+    List<UploadTask> smallFileTasks = [];
+    List<UploadTaskWithFile> largeFileTasks = [];
+    final cancellationToken = CancellationToken();
+
     for (final asset in localAssets) {
-      final task = await getUploadTask(
-        asset,
-        group: kManualUploadGroup,
-        priority: 1, // High priority after upload motion photo part
-      );
-      if (task != null) {
-        tasks.add(task);
+      final taskWithFile = await _getUploadTaskWithFile(asset);
+      if (taskWithFile == null) continue;
+
+      final fileSize = taskWithFile.file.lengthSync();
+      if (fileSize >= kNativeTusUploadThreshold) {
+        // Large files use TUS
+        largeFileTasks.add(taskWithFile);
+      } else {
+        // Small files use FileDownloader
+        final task = await getUploadTask(
+          asset,
+          group: kManualUploadGroup,
+          priority: 1,
+        );
+        if (task != null) {
+          smallFileTasks.add(task);
+        }
       }
     }
 
-    if (tasks.isNotEmpty) {
-      await enqueueTasks(tasks);
+    // Upload large files via TUS first (foreground, with progress)
+    if (largeFileTasks.isNotEmpty) {
+      await _uploadRepository.backupWithDartClient(largeFileTasks, cancellationToken);
+    }
+
+    // Enqueue small files to FileDownloader (background)
+    if (smallFileTasks.isNotEmpty) {
+      await enqueueTasks(smallFileTasks);
     }
   }
 
   /// Find backup candidates
   /// Build the upload tasks
   /// Enqueue the tasks
+  /// Large files (>= 10MB) use TUS protocol for resumable uploads
   Future<void> startBackup(String userId, void Function(EnqueueStatus status) onEnqueueTasks) async {
     await _storageRepository.clearCache();
 
@@ -133,24 +154,47 @@ class UploadService {
 
     const batchSize = 100;
     int count = 0;
+    final cancellationToken = CancellationToken();
+
     for (int i = 0; i < candidates.length; i += batchSize) {
       if (shouldAbortQueuingTasks) {
+        cancellationToken.cancel();
         break;
       }
 
       final batch = candidates.skip(i).take(batchSize).toList();
-      List<UploadTask> tasks = [];
+      List<UploadTask> smallFileTasks = [];
+      List<UploadTaskWithFile> largeFileTasks = [];
+
       for (final asset in batch) {
-        final task = await getUploadTask(asset);
-        if (task != null) {
-          tasks.add(task);
+        // Check file size to determine upload method
+        final taskWithFile = await _getUploadTaskWithFile(asset);
+        if (taskWithFile == null) continue;
+
+        final fileSize = taskWithFile.file.lengthSync();
+        if (fileSize >= kNativeTusUploadThreshold) {
+          // Large files use TUS
+          largeFileTasks.add(taskWithFile);
+        } else {
+          // Small files use FileDownloader
+          final task = await getUploadTask(asset);
+          if (task != null) {
+            smallFileTasks.add(task);
+          }
         }
       }
 
-      if (tasks.isNotEmpty && !shouldAbortQueuingTasks) {
-        count += tasks.length;
-        await enqueueTasks(tasks);
+      // Upload large files via TUS first (foreground, with progress)
+      if (largeFileTasks.isNotEmpty && !shouldAbortQueuingTasks) {
+        await _uploadRepository.backupWithDartClient(largeFileTasks, cancellationToken);
+        count += largeFileTasks.length;
+        onEnqueueTasks(EnqueueStatus(enqueueCount: count, totalCount: candidates.length));
+      }
 
+      // Enqueue small files to FileDownloader (background)
+      if (smallFileTasks.isNotEmpty && !shouldAbortQueuingTasks) {
+        count += smallFileTasks.length;
+        await enqueueTasks(smallFileTasks);
         onEnqueueTasks(EnqueueStatus(enqueueCount: count, totalCount: candidates.length));
       }
     }

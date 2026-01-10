@@ -14,7 +14,7 @@ final nativeTusUploadRepositoryProvider = Provider((ref) {
   return repository;
 });
 
-const int kNativeTusUploadThreshold = 10 * 1024 * 1024;
+const int kNativeTusUploadThreshold = 50 * 1024 * 1024;
 
 class NativeTusUploadResult {
   final String? assetId;

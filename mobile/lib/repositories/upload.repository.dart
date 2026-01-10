@@ -132,8 +132,28 @@ class UploadRepository {
             },
           );
 
-          if (!result.isSuccess) {
+          if (result.isSuccess && result.assetId != null) {
+            // Emit a TaskStatusUpdate to trigger the backup state update
+            final responseBody = jsonEncode({'id': result.assetId, 'status': result.isDuplicate ? 'duplicate' : 'created'});
+            final update = TaskStatusUpdate(
+              candidate.task,
+              TaskStatus.complete,
+              null, // exception
+              responseBody,
+              null, // responseHeaders
+              result.isDuplicate ? 200 : 201, // responseStatusCode
+            );
+            onUploadStatus?.call(update);
+            logger.fine('Native tus upload completed for ${candidate.task.filename}: assetId=${result.assetId}');
+          } else {
             logger.warning('Native tus upload failed for ${candidate.task.filename}: ${result.error}');
+            // Emit a failed status update
+            final update = TaskStatusUpdate(
+              candidate.task,
+              TaskStatus.failed,
+              TaskException(result.error ?? 'Unknown error'),
+            );
+            onUploadStatus?.call(update);
           }
           continue;
         }

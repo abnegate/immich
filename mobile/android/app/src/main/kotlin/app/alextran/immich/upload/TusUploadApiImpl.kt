@@ -10,13 +10,12 @@ import io.tus.java.client.TusUploader
 import kotlinx.coroutines.*
 import java.io.File
 import java.net.URL
-import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 
 class TusUploadApiImpl(context: Context) : ImmichPlugin(), TusUploadApi {
   companion object {
     const val name = "TusUploadApi"
-    private const val CHUNK_SIZE = 5 * 1024 * 1024 // 5MB chunks
+    private const val CHUNK_SIZE = 50 * 1024 * 1024 // 50MB chunks for better performance
   }
 
   private val ctx: Context = context.applicationContext
@@ -26,13 +25,13 @@ class TusUploadApiImpl(context: Context) : ImmichPlugin(), TusUploadApi {
 
   override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
     super.onAttachedToEngine(binding)
-    TusUploadApiSetup.setUp(binding.binaryMessenger, this)
+    TusUploadApi.setUp(binding.binaryMessenger, this)
     callbackApi = TusUploadCallbackApi(binding.binaryMessenger)
   }
 
   override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
     super.onDetachedFromEngine(binding)
-    TusUploadApiSetup.setUp(binding.binaryMessenger, null)
+    TusUploadApi.setUp(binding.binaryMessenger, null)
     cancelAllUploadsSync()
     scope.cancel()
     callbackApi = null
@@ -54,9 +53,9 @@ class TusUploadApiImpl(context: Context) : ImmichPlugin(), TusUploadApi {
           enableResuming(TusPreferencesURLStore(ctx, uploadId))
         }
 
-        val headers = data.headers.toMutableMap()
-        headers["Tus-Resumable"] = "1.0.0"
-        client.headers = headers
+        // Note: Do NOT set Tus-Resumable here - tus-java-client sets it automatically
+        // Setting it twice results in "1.0.0, 1.0.0" which fails validation
+        client.headers = data.headers
 
         val upload = TusUpload(file).apply {
           // Set metadata
@@ -102,9 +101,8 @@ class TusUploadApiImpl(context: Context) : ImmichPlugin(), TusUploadApi {
 
         uploader.finish()
 
-        // HTTP headers are case-insensitive, but getHeaderField is case-sensitive
-        val assetId = uploader.httpURLConnection?.getHeaderField("X-Immich-Asset-Id")
-          ?: uploader.httpURLConnection?.getHeaderField("x-immich-asset-id")
+        // Fetch asset ID from server via HEAD request using the upload URL from uploader
+        val assetId = fetchAssetIdFromServer(uploader.uploadURL, data.headers)
 
         val urlStore = TusPreferencesURLStore(ctx, uploadId)
         urlStore.clear()
@@ -197,21 +195,40 @@ class TusUploadApiImpl(context: Context) : ImmichPlugin(), TusUploadApi {
   }
 
   private fun buildMetadata(data: TusUploadData): Map<String, String> {
+    // Note: Do NOT Base64 encode values here - tus-java-client handles encoding automatically
     val metadata = mutableMapOf<String, String>()
-    metadata["filename"] = encodeBase64(data.filename)
-    metadata["deviceAssetId"] = encodeBase64(data.deviceAssetId)
-    metadata["deviceId"] = encodeBase64(data.deviceId)
-    metadata["fileCreatedAt"] = encodeBase64(data.fileCreatedAt)
-    metadata["fileModifiedAt"] = encodeBase64(data.fileModifiedAt)
-    metadata["isFavorite"] = encodeBase64(data.isFavorite.toString())
+    metadata["filename"] = data.filename
+    metadata["deviceAssetId"] = data.deviceAssetId
+    metadata["deviceId"] = data.deviceId
+    metadata["fileCreatedAt"] = data.fileCreatedAt
+    metadata["fileModifiedAt"] = data.fileModifiedAt
+    metadata["isFavorite"] = data.isFavorite.toString()
 
-    data.duration?.let { metadata["duration"] = encodeBase64(it) }
-    data.livePhotoVideoId?.let { metadata["livePhotoVideoId"] = encodeBase64(it) }
+    data.duration?.let { metadata["duration"] = it }
+    data.livePhotoVideoId?.let { metadata["livePhotoVideoId"] = it }
 
     return metadata
   }
 
-  private fun encodeBase64(value: String): String {
-    return Base64.getEncoder().encodeToString(value.toByteArray(Charsets.UTF_8))
+  private fun fetchAssetIdFromServer(
+    uploadUrl: URL?,
+    headers: Map<String, String>
+  ): String? {
+    if (uploadUrl == null) return null
+    return try {
+      val connection = uploadUrl.openConnection() as java.net.HttpURLConnection
+      connection.requestMethod = "HEAD"
+      connection.setRequestProperty("Tus-Resumable", "1.0.0")
+      headers.forEach { (key, value) -> connection.setRequestProperty(key, value) }
+      connection.connect()
+
+      val assetId = connection.getHeaderField("X-Immich-Asset-Id")
+        ?: connection.getHeaderField("x-immich-asset-id")
+
+      connection.disconnect()
+      assetId
+    } catch (e: Exception) {
+      null
+    }
   }
 }

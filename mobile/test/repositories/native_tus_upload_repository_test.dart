@@ -185,8 +185,8 @@ void main() {
   });
 
   group('kNativeTusUploadThreshold', () {
-    test('should be 10MB', () {
-      expect(kNativeTusUploadThreshold, 10 * 1024 * 1024);
+    test('should be 50MB', () {
+      expect(kNativeTusUploadThreshold, 50 * 1024 * 1024);
     });
   });
 }

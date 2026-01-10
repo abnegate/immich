@@ -33,7 +33,7 @@ class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin {
         sessionIdentifier: "immich-tus-session",
         sessionConfiguration: .default,
         storageDirectory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!.appendingPathComponent("tus-uploads"),
-        chunkSize: 5 * 1024 * 1024 // 5MB chunks
+        chunkSize: 50 * 1024 * 1024 // 50MB chunks for better performance
       )
 
       client.delegate = self
@@ -53,19 +53,20 @@ class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin {
 
       let fileURL = URL(fileURLWithPath: data.filePath)
 
+      // Note: Do NOT Base64 encode values here - TUSKit handles encoding automatically
       var metadata: [String: String] = [:]
-      metadata["filename"] = encodeBase64(data.filename)
-      metadata["deviceAssetId"] = encodeBase64(data.deviceAssetId)
-      metadata["deviceId"] = encodeBase64(data.deviceId)
-      metadata["fileCreatedAt"] = encodeBase64(data.fileCreatedAt)
-      metadata["fileModifiedAt"] = encodeBase64(data.fileModifiedAt)
-      metadata["isFavorite"] = encodeBase64(String(data.isFavorite))
+      metadata["filename"] = data.filename
+      metadata["deviceAssetId"] = data.deviceAssetId
+      metadata["deviceId"] = data.deviceId
+      metadata["fileCreatedAt"] = data.fileCreatedAt
+      metadata["fileModifiedAt"] = data.fileModifiedAt
+      metadata["isFavorite"] = String(data.isFavorite)
 
       if let duration = data.duration {
-        metadata["duration"] = encodeBase64(duration)
+        metadata["duration"] = duration
       }
       if let livePhotoVideoId = data.livePhotoVideoId {
-        metadata["livePhotoVideoId"] = encodeBase64(livePhotoVideoId)
+        metadata["livePhotoVideoId"] = livePhotoVideoId
       }
 
       var headers: [String: String] = [:]
@@ -76,7 +77,7 @@ class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin {
       let uploadId = try client.uploadFileAt(
         filePath: fileURL,
         customHeaders: headers,
-        customMetadata: metadata
+        context: metadata
       )
 
       activeUploads[data.deviceAssetId] = uploadId
@@ -115,14 +116,10 @@ class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin {
   }
 
   func cancelAllUploads(completion: @escaping (Result<Void, Error>) -> Void) {
-    do {
-      try tusClient?.cancelAll()
-      activeUploads.removeAll()
-      uploadIdToDeviceAssetId.removeAll()
-      completion(.success(()))
-    } catch {
-      completion(.failure(error))
-    }
+    tusClient?.stopAndCancelAll()
+    activeUploads.removeAll()
+    uploadIdToDeviceAssetId.removeAll()
+    completion(.success(()))
   }
 
   func getUploadOffset(uploadId: String, completion: @escaping (Result<Int64?, Error>) -> Void) {
@@ -134,15 +131,7 @@ class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin {
     completion(.success(Array(activeUploads.keys)))
   }
 
-  private func encodeBase64(_ value: String) -> String {
-    return Data(value.utf8).base64EncodedString()
-  }
-
-  private func fetchAssetIdFromServer(uploadId: UUID, client: TUSClient, upload: TUSKit.Upload) async -> String? {
-    guard let uploadURL = try? await client.getUploadURL(forUploadId: uploadId) else {
-      return nil
-    }
-
+  private func fetchAssetIdFromServer(uploadURL: URL) async -> String? {
     var request = URLRequest(url: uploadURL)
     request.httpMethod = "HEAD"
     request.setValue("1.0.0", forHTTPHeaderField: "Tus-Resumable")
@@ -163,7 +152,7 @@ class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin {
 // MARK: - TUSClientDelegate
 
 extension TusUploadApiImpl: TUSClientDelegate {
-  func didStartUpload(id: UUID, client: TUSClient, forUpload upload: TUSKit.Upload, context: [String: String]?) {
+  func didStartUpload(id: UUID, context: [String: String]?, client: TUSClient) {
     guard let deviceAssetId = uploadIdToDeviceAssetId[id] else { return }
 
     callbackApi?.onStatusChange(
@@ -176,7 +165,7 @@ extension TusUploadApiImpl: TUSClientDelegate {
     ) { _ in }
   }
 
-  func didFinishUpload(id: UUID, client: TUSClient, forUpload upload: TUSKit.Upload, context: [String: String]?) {
+  func didFinishUpload(id: UUID, url: URL, context: [String: String]?, client: TUSClient) {
     guard let deviceAssetId = uploadIdToDeviceAssetId[id] else { return }
 
     let assetIdFromContext = context?["x-immich-asset-id"] ?? context?["X-Immich-Asset-Id"]
@@ -185,7 +174,7 @@ extension TusUploadApiImpl: TUSClientDelegate {
       completeUpload(deviceAssetId: deviceAssetId, tusId: id, assetId: assetId)
     } else {
       Task {
-        let assetId = await fetchAssetIdFromServer(uploadId: id, client: client, upload: upload)
+        let assetId = await fetchAssetIdFromServer(uploadURL: url)
         completeUpload(deviceAssetId: deviceAssetId, tusId: id, assetId: assetId)
       }
     }
@@ -205,7 +194,7 @@ extension TusUploadApiImpl: TUSClientDelegate {
     uploadIdToDeviceAssetId.removeValue(forKey: tusId)
   }
 
-  func uploadFailed(id: UUID, client: TUSClient, forUpload upload: TUSKit.Upload, error: Error, context: [String: String]?) {
+  func uploadFailed(id: UUID, error: Error, context: [String: String]?, client: TUSClient) {
     guard let deviceAssetId = uploadIdToDeviceAssetId[id] else { return }
 
     callbackApi?.onStatusChange(
@@ -229,7 +218,7 @@ extension TusUploadApiImpl: TUSClientDelegate {
     // This is global progress, not per-upload
   }
 
-  func progressFor(id: UUID, bytesUploaded: Int, totalBytes: Int, client: TUSClient) {
+  func progressFor(id: UUID, context: [String: String]?, bytesUploaded: Int, totalBytes: Int, client: TUSClient) {
     guard let deviceAssetId = uploadIdToDeviceAssetId[id] else { return }
 
     callbackApi?.onProgress(

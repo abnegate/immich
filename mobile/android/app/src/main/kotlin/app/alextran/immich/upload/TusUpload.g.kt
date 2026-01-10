@@ -144,44 +144,6 @@ data class TusUploadData (
 }
 
 /**
- * Result of tus upload
- *
- * Generated class from Pigeon that represents data sent in messages.
- */
-data class TusUploadResult (
-  val assetId: String? = null,
-  val error: String? = null,
-  val isDuplicate: Boolean
-)
- {
-  companion object {
-    fun fromList(pigeonVar_list: List<Any?>): TusUploadResult {
-      val assetId = pigeonVar_list[0] as String?
-      val error = pigeonVar_list[1] as String?
-      val isDuplicate = pigeonVar_list[2] as Boolean
-      return TusUploadResult(assetId, error, isDuplicate)
-    }
-  }
-  fun toList(): List<Any?> {
-    return listOf(
-      assetId,
-      error,
-      isDuplicate,
-    )
-  }
-  override fun equals(other: Any?): Boolean {
-    if (other !is TusUploadResult) {
-      return false
-    }
-    if (this === other) {
-      return true
-    }
-    return TusUploadPigeonUtils.deepEquals(toList(), other.toList())  }
-
-  override fun hashCode(): Int = toList().hashCode()
-}
-
-/**
  * Progress update for tus upload
  *
  * Generated class from Pigeon that represents data sent in messages.
@@ -269,15 +231,10 @@ private open class TusUploadPigeonCodec : StandardMessageCodec() {
       }
       130.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
-          TusUploadResult.fromList(it)
-        }
-      }
-      131.toByte() -> {
-        return (readValue(buffer) as? List<Any?>)?.let {
           TusProgressUpdate.fromList(it)
         }
       }
-      132.toByte() -> {
+      131.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
           TusStatusUpdate.fromList(it)
         }
@@ -291,16 +248,12 @@ private open class TusUploadPigeonCodec : StandardMessageCodec() {
         stream.write(129)
         writeValue(stream, value.toList())
       }
-      is TusUploadResult -> {
+      is TusProgressUpdate -> {
         stream.write(130)
         writeValue(stream, value.toList())
       }
-      is TusProgressUpdate -> {
-        stream.write(131)
-        writeValue(stream, value.toList())
-      }
       is TusStatusUpdate -> {
-        stream.write(132)
+        stream.write(131)
         writeValue(stream, value.toList())
       }
       else -> super.writeValue(stream, value)

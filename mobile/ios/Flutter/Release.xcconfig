@@ -1,2 +1,5 @@
 #include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"
 #include "Generated.xcconfig"
+
+// Workaround for Xcode 26 explicit module builds breaking Swift macros
+SWIFT_ENABLE_EXPLICIT_MODULES = NO

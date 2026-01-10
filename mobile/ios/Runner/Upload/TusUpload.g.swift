@@ -11,23 +11,8 @@ import Foundation
   #error("Unsupported platform.")
 #endif
 
-/// Error class for passing custom error details to Dart side.
-final class PigeonError: Error {
-  let code: String
-  let message: String?
-  let details: Sendable?
-
-  init(code: String, message: String?, details: Sendable?) {
-    self.code = code
-    self.message = message
-    self.details = details
-  }
-
-  var localizedDescription: String {
-    return
-      "PigeonError(code: \(code), message: \(message ?? "<nil>"), details: \(details ?? "<nil>")"
-  }
-}
+// PigeonError class is already defined in Messages.g.swift
+// Removed duplicate to avoid ambiguity errors
 
 private func wrapResult(_ result: Any?) -> [Any?] {
   return [result]
@@ -199,41 +184,6 @@ struct TusUploadData: Hashable {
   }
 }
 
-/// Result of tus upload
-///
-/// Generated class from Pigeon that represents data sent in messages.
-struct TusUploadResult: Hashable {
-  var assetId: String? = nil
-  var error: String? = nil
-  var isDuplicate: Bool
-
-
-  // swift-format-ignore: AlwaysUseLowerCamelCase
-  static func fromList(_ pigeonVar_list: [Any?]) -> TusUploadResult? {
-    let assetId: String? = nilOrValue(pigeonVar_list[0])
-    let error: String? = nilOrValue(pigeonVar_list[1])
-    let isDuplicate = pigeonVar_list[2] as! Bool
-
-    return TusUploadResult(
-      assetId: assetId,
-      error: error,
-      isDuplicate: isDuplicate
-    )
-  }
-  func toList() -> [Any?] {
-    return [
-      assetId,
-      error,
-      isDuplicate,
-    ]
-  }
-  static func == (lhs: TusUploadResult, rhs: TusUploadResult) -> Bool {
-    return deepEqualsTusUpload(lhs.toList(), rhs.toList())  }
-  func hash(into hasher: inout Hasher) {
-    deepHashTusUpload(value: toList(), hasher: &hasher)
-  }
-}
-
 /// Progress update for tus upload
 ///
 /// Generated class from Pigeon that represents data sent in messages.
@@ -314,10 +264,8 @@ private class TusUploadPigeonCodecReader: FlutterStandardReader {
     case 129:
       return TusUploadData.fromList(self.readValue() as! [Any?])
     case 130:
-      return TusUploadResult.fromList(self.readValue() as! [Any?])
-    case 131:
       return TusProgressUpdate.fromList(self.readValue() as! [Any?])
-    case 132:
+    case 131:
       return TusStatusUpdate.fromList(self.readValue() as! [Any?])
     default:
       return super.readValue(ofType: type)
@@ -330,14 +278,11 @@ private class TusUploadPigeonCodecWriter: FlutterStandardWriter {
     if let value = value as? TusUploadData {
       super.writeByte(129)
       super.writeValue(value.toList())
-    } else if let value = value as? TusUploadResult {
+    } else if let value = value as? TusProgressUpdate {
       super.writeByte(130)
       super.writeValue(value.toList())
-    } else if let value = value as? TusProgressUpdate {
-      super.writeByte(131)
-      super.writeValue(value.toList())
     } else if let value = value as? TusStatusUpdate {
-      super.writeByte(132)
+      super.writeByte(131)
       super.writeValue(value.toList())
     } else {
       super.writeValue(value)
