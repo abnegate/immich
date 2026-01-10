@@ -2,13 +2,12 @@
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import ActionButton from '$lib/components/ActionButton.svelte';
+  import ActionMenuItem from '$lib/components/ActionMenuItem.svelte';
   import type { OnAction, PreAction } from '$lib/components/asset-viewer/actions/action';
   import AddToAlbumAction from '$lib/components/asset-viewer/actions/add-to-album-action.svelte';
   import AddToStackAction from '$lib/components/asset-viewer/actions/add-to-stack-action.svelte';
   import ArchiveAction from '$lib/components/asset-viewer/actions/archive-action.svelte';
   import DeleteAction from '$lib/components/asset-viewer/actions/delete-action.svelte';
-  import DownloadAction from '$lib/components/asset-viewer/actions/download-action.svelte';
-  import FavoriteAction from '$lib/components/asset-viewer/actions/favorite-action.svelte';
   import KeepThisDeleteOthersAction from '$lib/components/asset-viewer/actions/keep-this-delete-others.svelte';
   import RatingAction from '$lib/components/asset-viewer/actions/rating-action.svelte';
   import RemoveAssetFromStack from '$lib/components/asset-viewer/actions/remove-asset-from-stack.svelte';
@@ -28,7 +27,7 @@
   import { photoViewerImgElement } from '$lib/stores/assets-store.svelte';
   import { user } from '$lib/stores/user.store';
   import { photoZoomState } from '$lib/stores/zoom-image.store';
-  import { getAssetJobName, getSharedLink } from '$lib/utils';
+  import { getAssetJobName, withoutIcons } from '$lib/utils';
   import type { OnUndoDelete } from '$lib/utils/actions';
   import { canCopyImageToClipboard } from '$lib/utils/asset-utils';
   import { toTimelineAsset } from '$lib/utils/timeline-util';
@@ -73,7 +72,7 @@
     onUndoDelete?: OnUndoDelete;
     onRunJob: (name: AssetJobName) => void;
     onPlaySlideshow: () => void;
-    // export let showEditorHandler: () => void;
+    // onEdit: () => void;
     onClose?: () => void;
     playOriginalVideo: boolean;
     setPlayOriginalVideo: (value: boolean) => void;
@@ -93,18 +92,18 @@
     onRunJob,
     onPlaySlideshow,
     onClose,
+    // onEdit,
     playOriginalVideo = false,
     setPlayOriginalVideo,
   }: Props = $props();
 
-  const sharedLink = getSharedLink();
   let isOwner = $derived($user && asset.ownerId === $user?.id);
-  let showDownloadButton = $derived(sharedLink ? sharedLink.allowDownload : !asset.isOffline);
   let isLocked = $derived(asset.visibility === AssetVisibility.Locked);
   let smartSearchEnabled = $derived(featureFlagsManager.value.smartSearch);
 
   const Close: ActionItem = {
     title: $t('go_back'),
+    type: $t('assets'),
     icon: mdiArrowLeft,
     $if: () => !!onClose,
     onAction: () => onClose?.(),
@@ -113,22 +112,26 @@
 
   const { Cast } = $derived(getGlobalActions($t));
 
-  const { Share, Offline, PlayMotionPhoto, StopMotionPhoto, Info } = $derived(getAssetActions($t, asset));
+  const { Share, Download, SharedLinkDownload, Offline, Favorite, Unfavorite, PlayMotionPhoto, StopMotionPhoto, Info } =
+    $derived(getAssetActions($t, asset));
 
-  // $: showEditorButton =
+  // TODO: Enable when edits are ready for release
+  // let showEditorButton = $derived(
   //   isOwner &&
-  //   asset.type === AssetTypeEnum.Image &&
-  //   !(
-  //     asset.exifInfo?.projectionType === ProjectionType.EQUIRECTANGULAR ||
-  //     (asset.originalPath && asset.originalPath.toLowerCase().endsWith('.insp'))
-  //   ) &&
-  //   !(asset.originalPath && asset.originalPath.toLowerCase().endsWith('.gif')) &&
-  //   !asset.livePhotoVideoId;
+  //     asset.type === AssetTypeEnum.Image &&
+  //     !(
+  //       asset.exifInfo?.projectionType === ProjectionType.EQUIRECTANGULAR ||
+  //       (asset.originalPath && asset.originalPath.toLowerCase().endsWith('.insp'))
+  //     ) &&
+  //     !(asset.originalPath && asset.originalPath.toLowerCase().endsWith('.gif')) &&
+  //     !(asset.originalPath && asset.originalPath.toLowerCase().endsWith('.svg')) &&
+  //     !asset.livePhotoVideoId,
+  // );
 </script>
 
 <CommandPaletteDefaultProvider
   name={$t('assets')}
-  actions={[Close, Share, Offline, PlayMotionPhoto, StopMotionPhoto, Info]}
+  actions={withoutIcons([Close, Share, Offline, Favorite, Unfavorite, PlayMotionPhoto, StopMotionPhoto, Info])}
 />
 
 <div
@@ -167,16 +170,18 @@
       />
     {/if}
 
-    {#if !isOwner && showDownloadButton}
-      <DownloadAction asset={toTimelineAsset(asset)} />
-    {/if}
-
+    <ActionButton action={SharedLinkDownload} />
     <ActionButton action={Info} />
+    <ActionButton action={Favorite} />
+    <ActionButton action={Unfavorite} />
 
     {#if isOwner}
-      <FavoriteAction {asset} {onAction} />
       <RatingAction {asset} {onAction} />
     {/if}
+
+    <!-- {#if showEditorButton}
+      <EditAction onAction={onEdit} />
+    {/if} -->
 
     {#if isOwner}
       <DeleteAction {asset} {onAction} {preAction} {onUndoDelete} />
@@ -185,9 +190,8 @@
         {#if showSlideshow && !isLocked}
           <MenuOption icon={mdiPresentationPlay} text={$t('slideshow')} onClick={onPlaySlideshow} />
         {/if}
-        {#if showDownloadButton}
-          <DownloadAction asset={toTimelineAsset(asset)} menuItem />
-        {/if}
+
+        <ActionMenuItem action={Download} />
 
         {#if !isLocked}
           {#if asset.isTrashed}
