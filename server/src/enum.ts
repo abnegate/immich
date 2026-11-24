@@ -490,6 +490,7 @@ export enum MetadataKey {
 export enum RouteKey {
   Asset = 'assets',
   User = 'users',
+  Upload = 'upload',
 }
 
 export enum CacheControl {
@@ -633,6 +634,8 @@ export enum JobName {
   PersonGenerateThumbnail = 'PersonGenerateThumbnail',
 
   SessionCleanup = 'SessionCleanup',
+
+  TusUploadCleanup = 'TusUploadCleanup',
 
   SendMail = 'SendMail',
 

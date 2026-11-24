@@ -41,6 +41,7 @@ import { TagService } from 'src/services/tag.service';
 import { TelemetryService } from 'src/services/telemetry.service';
 import { TimelineService } from 'src/services/timeline.service';
 import { TrashService } from 'src/services/trash.service';
+import { TusService } from 'src/services/tus.service';
 import { UserAdminService } from 'src/services/user-admin.service';
 import { UserService } from 'src/services/user.service';
 import { VersionService } from 'src/services/version.service';
@@ -91,6 +92,7 @@ export const services = [
   TelemetryService,
   TimelineService,
   TrashService,
+  TusService,
   UserAdminService,
   UserService,
   VersionService,

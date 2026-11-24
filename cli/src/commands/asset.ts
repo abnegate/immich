@@ -16,11 +16,70 @@ import { Matcher, watch as watchFs } from 'chokidar';
 import { MultiBar, Presets, SingleBar } from 'cli-progress';
 import { chunk } from 'lodash-es';
 import micromatch from 'micromatch';
-import { Stats, createReadStream } from 'node:fs';
-import { stat, unlink } from 'node:fs/promises';
-import path, { basename } from 'node:path';
+import { createHash } from 'node:crypto';
+import { createReadStream, type ReadStream, type Stats } from 'node:fs';
+import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import path, { basename, join } from 'node:path';
+import { Readable } from 'node:stream';
 import { Queue } from 'src/queue';
 import { BaseOptions, Batcher, authenticate, crawl, sha1 } from 'src/utils';
+import * as tus from 'tus-js-client';
+
+class FileUrlStorage implements tus.UrlStorage {
+  private readonly directory = join(homedir(), '.cache', 'immich-cli', 'tus-uploads');
+
+  private async ensureDirectory(): Promise<void> {
+    await mkdir(this.directory, { recursive: true });
+  }
+
+  private paths(fingerprint: string): [current: string, legacy: string] {
+    const hash = createHash('sha256').update(fingerprint).digest('hex');
+    const legacy = Buffer.from(fingerprint).toString('base64url');
+    return [join(this.directory, `${hash}.json`), join(this.directory, `${legacy}.json`)];
+  }
+
+  async findAllUploads(): Promise<tus.PreviousUpload[]> {
+    return [];
+  }
+
+  async findUploadsByFingerprint(fingerprint: string): Promise<tus.PreviousUpload[]> {
+    try {
+      await this.ensureDirectory();
+    } catch {
+      return [];
+    }
+
+    for (const filename of this.paths(fingerprint)) {
+      try {
+        const data = await readFile(filename, 'utf8');
+        const upload = JSON.parse(data) as tus.PreviousUpload;
+        return [{ ...upload, urlStorageKey: fingerprint }];
+      } catch {
+        // The other cache filename may still contain the resume URL.
+      }
+    }
+    return [];
+  }
+
+  async removeUpload(fingerprint: string): Promise<void> {
+    await Promise.allSettled(this.paths(fingerprint).map((filename) => unlink(filename)));
+  }
+
+  async addUpload(fingerprint: string, upload: tus.PreviousUpload): Promise<string> {
+    try {
+      await this.ensureDirectory();
+      const [filename] = this.paths(fingerprint);
+      await writeFile(filename, JSON.stringify(upload));
+      return fingerprint;
+    } catch {
+      // tus accepts an empty storage key when no resume entry was saved.
+      return '';
+    }
+  }
+}
+
+const urlStorage = new FileUrlStorage();
 
 const UPLOAD_WATCH_BATCH_SIZE = 100;
 const UPLOAD_WATCH_DEBOUNCE_TIME_MS = 10_000;
@@ -30,6 +89,8 @@ const s = (count: number) => (count === 1 ? '' : 's');
 // TODO figure out why `id` is missing
 type AssetBulkUploadCheckResults = Array<AssetBulkUploadCheckResult & { id: string }>;
 type Asset = { id: string; filepath: string };
+
+const RESUMABLE_CHUNK_SIZE = 50 * 1024 * 1024;
 
 export interface UploadOptionsDto {
   recursive?: boolean;
@@ -45,22 +106,36 @@ export interface UploadOptionsDto {
   progress?: boolean;
   watch?: boolean;
   jsonOutput?: boolean;
+  resumable?: boolean;
 }
 
 class UploadFile extends File {
+  private activeStream?: ReadStream;
+
   constructor(
-    private filepath: string,
-    private _size: number,
+    private readonly filepath: string,
+    private readonly length: number,
   ) {
     super([], basename(filepath));
   }
 
-  get size() {
-    return this._size;
+  override get size(): number {
+    return this.length;
   }
 
-  stream() {
-    return createReadStream(this.filepath) as any;
+  override stream(): ReturnType<File['stream']> {
+    this.activeStream?.destroy();
+    const stream = createReadStream(this.filepath);
+    this.activeStream = stream;
+
+    stream.once('close', () => {
+      if (this.activeStream === stream) {
+        this.activeStream = undefined;
+      }
+    });
+
+    // Node and DOM declarations describe the same runtime web stream differently.
+    return Readable.toWeb(stream) as ReturnType<File['stream']>;
   }
 }
 
@@ -267,7 +342,7 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
 
 export const uploadFiles = async (
   files: string[],
-  { dryRun, concurrency, progress }: UploadOptionsDto,
+  { dryRun, concurrency, progress, resumable }: UploadOptionsDto,
 ): Promise<Asset[]> => {
   if (files.length === 0) {
     console.log('All assets were already uploaded, nothing to do.');
@@ -317,7 +392,14 @@ export const uploadFiles = async (
         throw new Error(`Stats not found for ${filepath}`);
       }
 
-      const response = await uploadFile(filepath, stats);
+      const response = await uploadFile(filepath, stats, {
+        resumable,
+        onProgress: (bytesUploaded) => {
+          uploadProgress?.update(successSize + bytesUploaded, {
+            value_formatted: byteSize(successSize + duplicateSize + bytesUploaded),
+          });
+        },
+      });
       newAssets.push({ id: response.id, filepath });
       if (response.status === AssetMediaStatus.Duplicate) {
         duplicateCount++;
@@ -359,25 +441,182 @@ export const uploadFiles = async (
   return newAssets;
 };
 
-const uploadFile = async (input: string, stats: Stats): Promise<AssetMediaResponseDto> => {
-  const { baseUrl, headers } = defaults;
-
+const getSidecarPath = async (input: string): Promise<string | undefined> => {
   const assetPath = path.parse(input);
   const noExtension = path.join(assetPath.dir, assetPath.name);
 
-  const sidecarsFiles = await Promise.all(
-    // XMP sidecars can come in two filename formats. For a photo named photo.ext, the filenames are photo.ext.xmp and photo.xmp
-    [`${noExtension}.xmp`, `${input}.xmp`].map(async (sidecarPath) => {
-      try {
-        const stats = await stat(sidecarPath);
-        return new UploadFile(sidecarPath, stats.size);
-      } catch {
-        return false;
-      }
-    }),
-  );
+  // XMP sidecars can come in two filename formats. For a photo named photo.ext, the filenames are photo.ext.xmp and photo.xmp
+  for (const sidecarPath of [`${noExtension}.xmp`, `${input}.xmp`]) {
+    try {
+      await stat(sidecarPath);
+      return sidecarPath;
+    } catch {
+      // File doesn't exist, try next
+    }
+  }
+  return undefined;
+};
 
-  const sidecarData = sidecarsFiles.find((file): file is UploadFile => file !== false);
+const uploadFileResumable = async (
+  input: string,
+  stats: Stats,
+  onProgress?: (bytesUploaded: number) => void,
+): Promise<AssetMediaResponseDto | void> => {
+  const { baseUrl, headers } = defaults;
+  const endpoint = `${baseUrl}/upload`;
+  const origin = new URL(endpoint).origin;
+  const validateUploadUrl = (value: string, base = endpoint): URL => {
+    const url = new URL(value, base);
+    if (url.origin !== origin) {
+      throw new Error('The resumable upload URL has a different origin than the Immich server');
+    }
+    return url;
+  };
+
+  const sidecarPath = await getSidecarPath(input);
+  const sidecarStats = sidecarPath ? await stat(sidecarPath) : undefined;
+  const sidecar = sidecarPath && sidecarStats?.size ? new UploadFile(sidecarPath, sidecarStats.size) : undefined;
+
+  const deviceAssetId = `${basename(input)}-${stats.size}`.replaceAll(/\s+/g, '');
+
+  const file = createReadStream(input);
+  try {
+    return await new Promise<AssetMediaResponseDto | void>((resolve, reject) => {
+      let hasUploadUrl = false;
+      let stagedUrl: string | undefined;
+      let resumedWithSidecar = false;
+      const upload = new tus.Upload(file, {
+        endpoint,
+        headers: headers as Record<string, string>,
+        uploadSize: stats.size,
+        chunkSize: RESUMABLE_CHUNK_SIZE,
+        metadata: {
+          filename: basename(input),
+          filetype: '',
+          deviceAssetId,
+          deviceId: 'CLI',
+          fileCreatedAt: stats.mtime.toISOString(),
+          fileModifiedAt: stats.mtime.toISOString(),
+          isFavorite: 'false',
+          ...(sidecar && { sidecarRequired: 'true' }),
+        },
+        storeFingerprintForResuming: true,
+        urlStorage,
+        removeFingerprintOnSuccess: true,
+        onUploadUrlAvailable: () => {
+          hasUploadUrl = true;
+        },
+        onBeforeRequest: (request) => {
+          validateUploadUrl(request.getURL());
+        },
+        onAfterResponse: async (request, response) => {
+          const status = response.getStatus();
+          if (!sidecar || status < 200 || status >= 300) {
+            return;
+          }
+
+          const method = request.getMethod();
+          let location: string | undefined;
+          if (method === 'POST') {
+            location = response.getHeader('Location');
+          } else if (method === 'HEAD') {
+            const offset = Number(response.getHeader('Upload-Offset'));
+            const length = Number(response.getHeader('Upload-Length'));
+            if (offset < length) {
+              location = request.getURL();
+            }
+          }
+          if (!location) {
+            return;
+          }
+
+          const url = validateUploadUrl(location, request.getURL());
+          const uploadUrl = url.href;
+          if (stagedUrl === uploadUrl) {
+            return;
+          }
+
+          if (method === 'POST') {
+            // Keep the created URL so a failed sidecar request can retry the same upload.
+            hasUploadUrl = true;
+            upload.url = uploadUrl;
+          }
+
+          url.pathname += '/sidecar';
+          const sidecarHeaders = new Headers(headers as Record<string, string>);
+          sidecarHeaders.set('Content-Type', 'application/octet-stream');
+          sidecarHeaders.set('Content-Length', String(sidecar.size));
+
+          const sidecarResponse = await fetch(url, {
+            method: 'PUT',
+            redirect: 'error',
+            headers: sidecarHeaders,
+            body: sidecar,
+          });
+          if (sidecarResponse.status !== 204) {
+            throw new Error(`Failed to stage XMP sidecar (HTTP ${sidecarResponse.status})`);
+          }
+
+          stagedUrl = uploadUrl;
+        },
+        onError: (error) => {
+          if (!hasUploadUrl && error instanceof tus.DetailedError && error.originalRequest?.getMethod() === 'POST') {
+            const status = error.originalResponse?.getStatus();
+            if (status === 404 || status === 405) {
+              resolve();
+              return;
+            }
+          }
+
+          reject(error);
+        },
+        onProgress,
+        onSuccess: ({ lastResponse }) => {
+          if (sidecar && !stagedUrl && !resumedWithSidecar) {
+            reject(new Error('The completed resumable upload has no XMP sidecar'));
+            return;
+          }
+
+          const id = lastResponse.getHeader('X-Immich-Asset-Id');
+          if (!id) {
+            reject(new Error('Resumable upload response did not include an asset ID'));
+            return;
+          }
+
+          const duplicate = lastResponse.getHeader('X-Immich-Duplicate')?.toLowerCase() === 'true';
+          resolve({ id, status: duplicate ? AssetMediaStatus.Duplicate : AssetMediaStatus.Created });
+        },
+      });
+
+      file.once('error', reject);
+      void upload
+        .findPreviousUploads()
+        .catch(() => [])
+        .then(([previous]) => {
+          if (previous?.uploadUrl) {
+            hasUploadUrl = true;
+            resumedWithSidecar =
+              previous.metadata?.sidecarRequired === 'true' || Boolean(previous.metadata?.sidecarData);
+            upload.resumeFromPreviousUpload(previous);
+          }
+          upload.start();
+        })
+        .catch(reject);
+    });
+  } finally {
+    file.destroy();
+  }
+};
+
+const uploadFileFormData = async (input: string, stats: Stats): Promise<AssetMediaResponseDto> => {
+  const { baseUrl, headers } = defaults;
+
+  const sidecarPath = await getSidecarPath(input);
+  let sidecarFile: UploadFile | undefined;
+  if (sidecarPath) {
+    const sidecarStats = await stat(sidecarPath);
+    sidecarFile = new UploadFile(sidecarPath, sidecarStats.size);
+  }
 
   const formData = new FormData();
   formData.append('deviceAssetId', `${basename(input)}-${stats.size}`.replaceAll(/\s+/g, ''));
@@ -388,8 +627,8 @@ const uploadFile = async (input: string, stats: Stats): Promise<AssetMediaRespon
   formData.append('isFavorite', 'false');
   formData.append('assetData', new UploadFile(input, stats.size));
 
-  if (sidecarData) {
-    formData.append('sidecarData', sidecarData);
+  if (sidecarFile) {
+    formData.append('sidecarData', sidecarFile);
   }
 
   const response = await fetch(`${baseUrl}/assets`, {
@@ -403,6 +642,21 @@ const uploadFile = async (input: string, stats: Stats): Promise<AssetMediaRespon
   }
 
   return response.json();
+};
+
+const uploadFile = async (
+  input: string,
+  stats: Stats,
+  options: { resumable?: boolean; onProgress?: (bytesUploaded: number) => void } = {},
+): Promise<AssetMediaResponseDto> => {
+  if (options.resumable && stats.size >= RESUMABLE_CHUNK_SIZE) {
+    const response = await uploadFileResumable(input, stats, options.onProgress);
+    if (response) {
+      return response;
+    }
+  }
+
+  return uploadFileFormData(input, stats);
 };
 
 const deleteFiles = async (uploaded: Asset[], duplicates: Asset[], options: UploadOptionsDto): Promise<void> => {

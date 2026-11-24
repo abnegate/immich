@@ -1,11 +1,11 @@
-.PHONY: build watch create_app_icon create_splash build_release_android pigeon test analyze format
+.PHONY: build watch create_app_icon create_splash build_release_android pigeon pigeon-tus test analyze format
 
 build:
 	dart run build_runner build --delete-conflicting-outputs
 # Remove once auto_route updated to 10.1.0
 	dart format lib/routing/router.gr.dart
 
-pigeon:
+pigeon: pigeon-tus
 	dart run pigeon --input pigeon/native_sync_api.dart
 	dart run pigeon --input pigeon/thumbnail_api.dart
 	dart run pigeon --input pigeon/background_worker_api.dart
@@ -16,6 +16,14 @@ pigeon:
 	dart format lib/platform/background_worker_api.g.dart
 	dart format lib/platform/background_worker_lock_api.g.dart
 	dart format lib/platform/connectivity_api.g.dart
+
+pigeon-tus:
+	dart run pigeon --input pigeon/tus_upload_api.dart
+	dart format lib/platform/tus_upload_api.g.dart
+	sed -i.bak 's/[[:blank:]]*$$//' \
+	  ios/Runner/Upload/TusUpload.g.swift \
+	  android/app/src/main/kotlin/app/alextran/immich/upload/TusUpload.g.kt
+	rm ios/Runner/Upload/TusUpload.g.swift.bak android/app/src/main/kotlin/app/alextran/immich/upload/TusUpload.g.kt.bak
 
 watch:
 	dart run build_runner watch --delete-conflicting-outputs

@@ -18,6 +18,7 @@ import {
 import { tick } from 'svelte';
 import { t } from 'svelte-i18n';
 import { get } from 'svelte/store';
+import * as tus from 'tus-js-client';
 import { handleError } from './handle-error';
 
 export const addDummyItems = () => {
@@ -40,6 +41,9 @@ export const addDummyItems = () => {
 };
 
 // addDummyItems();
+
+const RESUMABLE_CHUNK_SIZE = 50 * 1024 * 1024;
+const activeUploads = new Map<string, () => void>();
 
 export const uploadExecutionQueue = new ExecutorQueue({ concurrency: 2 });
 
@@ -116,6 +120,117 @@ type FileUploaderParams = {
   deviceAssetId: string;
 };
 
+async function uploadFileResumable(
+  assetFile: File,
+  deviceAssetId: string,
+  fileCreatedAt: string,
+  onProgress: (bytesUploaded: number, bytesTotal: number) => void,
+  isLockedAssets = false,
+): Promise<AssetMediaResponseDto | undefined> {
+  const metadata: Record<string, string> = {
+    filename: assetFile.name,
+    filetype: assetFile.type,
+    deviceAssetId,
+    deviceId: 'WEB',
+    fileCreatedAt,
+    fileModifiedAt: new Date(assetFile.lastModified).toISOString(),
+    isFavorite: 'false',
+    duration: '0:00:00.000000',
+  };
+
+  if (isLockedAssets) {
+    metadata.visibility = AssetVisibility.Locked;
+  }
+
+  let cancel: (() => void) | undefined;
+  try {
+    return await new Promise<AssetMediaResponseDto | undefined>((resolve, reject) => {
+      let hasUploadUrl = false;
+      let canceled = false;
+      const cancellation = new DOMException('Upload canceled', 'AbortError');
+      const upload = new tus.Upload(assetFile, {
+        endpoint: `${getBaseUrl()}/upload`,
+        metadata,
+        chunkSize: RESUMABLE_CHUNK_SIZE,
+        removeFingerprintOnSuccess: true,
+        storeFingerprintForResuming: true,
+        onUploadUrlAvailable: () => {
+          hasUploadUrl = true;
+        },
+        onBeforeRequest: async () => {
+          if (canceled) {
+            // tus can finish preparing its file source after abort() is called.
+            await upload.abort();
+            throw cancellation;
+          }
+        },
+        onError: (error) => {
+          if (!hasUploadUrl && error instanceof tus.DetailedError && error.originalRequest?.getMethod() === 'POST') {
+            const status = error.originalResponse?.getStatus();
+            if (status === 404 || status === 405) {
+              resolve(undefined);
+              return;
+            }
+          }
+
+          reject(error);
+        },
+        onProgress,
+        onSuccess: ({ lastResponse }) => {
+          const id = lastResponse.getHeader('X-Immich-Asset-Id');
+          if (!id) {
+            reject(new Error('Resumable upload response did not include an asset ID'));
+            return;
+          }
+
+          const duplicate = lastResponse.getHeader('X-Immich-Duplicate')?.toLowerCase() === 'true';
+          resolve({ id, status: duplicate ? AssetMediaStatus.Duplicate : AssetMediaStatus.Created });
+        },
+      });
+
+      cancel = () => {
+        canceled = true;
+        reject(cancellation);
+        void upload.abort().catch(console.error);
+      };
+      activeUploads.set(deviceAssetId, cancel);
+
+      void upload
+        .findPreviousUploads()
+        .catch((error) => {
+          console.warn('Could not check for previous uploads:', error);
+          upload.options.storeFingerprintForResuming = false;
+          return [];
+        })
+        .then((previousUploads) => {
+          if (canceled) {
+            return;
+          }
+
+          const previous = previousUploads.find(
+            (previous) => previous.uploadUrl && previous.metadata.visibility === metadata.visibility,
+          );
+          if (previous) {
+            hasUploadUrl = true;
+            upload.resumeFromPreviousUpload(previous);
+          }
+          upload.start();
+        })
+        .catch(reject);
+    });
+  } finally {
+    if (activeUploads.get(deviceAssetId) === cancel) {
+      activeUploads.delete(deviceAssetId);
+    }
+  }
+}
+
+export function cancelUpload(deviceAssetId: string): void {
+  const cancel = activeUploads.get(deviceAssetId);
+  activeUploads.delete(deviceAssetId);
+  cancel?.();
+}
+
 // TODO: should probably use the @api SDK
 async function fileUploader({
   assetFile,
@@ -129,23 +244,6 @@ async function fileUploader({
   uploadAssetsStore.markStarted(deviceAssetId);
 
   try {
-    const formData = new FormData();
-    for (const [key, value] of Object.entries({
-      deviceAssetId,
-      deviceId: 'WEB',
-      fileCreatedAt,
-      fileModifiedAt: new Date(assetFile.lastModified).toISOString(),
-      isFavorite: 'false',
-      duration: '0:00:00.000000',
-      assetData: new File([assetFile], assetFile.name),
-    })) {
-      formData.append(key, value);
-    }
-
-    if (isLockedAssets) {
-      formData.append('visibility', AssetVisibility.Locked);
-    }
-
     let responseData: { id: string; status: AssetMediaStatus; isTrashed?: boolean } | undefined;
     if (crypto?.subtle?.digest && !authManager.isSharedLink) {
       uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_hashing') });
@@ -173,20 +271,49 @@ async function fileUploader({
     }
 
     if (!responseData) {
-      const queryParams = asQueryString(authManager.params);
-
       uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_uploading') });
-      const response = await uploadRequest<AssetMediaResponseDto>({
-        url: getBaseUrl() + '/assets' + (queryParams ? `?${queryParams}` : ''),
-        data: formData,
-        onUploadProgress: (event) => uploadAssetsStore.updateProgress(deviceAssetId, event.loaded, event.total),
-      });
 
-      if (![200, 201].includes(response.status)) {
-        throw new Error($t('errors.unable_to_upload_file'));
+      if (!authManager.isSharedLink && assetFile.size >= RESUMABLE_CHUNK_SIZE) {
+        responseData = await uploadFileResumable(
+          assetFile,
+          deviceAssetId,
+          fileCreatedAt,
+          (bytesUploaded, bytesTotal) => uploadAssetsStore.updateProgress(deviceAssetId, bytesUploaded, bytesTotal),
+          isLockedAssets,
+        );
       }
 
-      responseData = response.data;
+      if (!responseData) {
+        const formData = new FormData();
+        for (const [key, value] of Object.entries({
+          deviceAssetId,
+          deviceId: 'WEB',
+          fileCreatedAt,
+          fileModifiedAt: fileCreatedAt,
+          isFavorite: 'false',
+          duration: '0:00:00.000000',
+          assetData: new File([assetFile], assetFile.name),
+        })) {
+          formData.append(key, value);
+        }
+
+        if (isLockedAssets) {
+          formData.append('visibility', AssetVisibility.Locked);
+        }
+
+        const queryParams = asQueryString(authManager.params);
+        const response = await uploadRequest<AssetMediaResponseDto>({
+          url: getBaseUrl() + '/assets' + (queryParams ? `?${queryParams}` : ''),
+          data: formData,
+          onUploadProgress: (event) => uploadAssetsStore.updateProgress(deviceAssetId, event.loaded, event.total),
+        });
+
+        if (![200, 201].includes(response.status)) {
+          throw new Error($t('errors.unable_to_upload_file'));
+        }
+
+        responseData = response.data;
+      }
     }
 
     if (responseData.status === AssetMediaStatus.Duplicate) {
@@ -215,6 +342,11 @@ async function fileUploader({
 
     return responseData.id;
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      uploadAssetsStore.removeItem(deviceAssetId);
+      return;
+    }
+
     // ignore errors if the user logs out during uploads
     if (!get(user)) {
       return;

@@ -1,0 +1,1332 @@
+/**
+ * TUS (Resumable Upload) Protocol E2E Tests
+ *
+ * This test suite provides comprehensive coverage of the TUS protocol implementation
+ * for resumable file uploads in Immich. It tests all aspects of the protocol including
+ * upload creation, chunked uploading, status checking, cancellation, and metadata handling.
+ */
+import { AssetTypeEnum, LoginResponseDto, Permission } from '@immich/sdk';
+import { readFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
+import { createUserDto, uuidDto } from 'src/fixtures';
+import { makeRandomImage } from 'src/generators';
+import { errorDto } from 'src/responses';
+import { app, testAssetDir, utils } from 'src/utils';
+import request from 'supertest';
+import { beforeAll, describe, expect, it } from 'vitest';
+
+// Standard chunk size used by clients (50MB)
+const CHUNK_SIZE = 50 * 1024 * 1024;
+
+// Helper to encode metadata in base64 as required by TUS protocol
+const encodeMetadata = (metadata: Record<string, string>): string => {
+  return Object.entries(metadata)
+    .map(([key, value]) => `${key} ${Buffer.from(value).toString('base64')}`)
+    .join(',');
+};
+
+// Helper to extract upload ID from Location header
+// Location format: /api/upload/userId/xx/yy/uuid or similar
+const extractUploadId = (location: string): string => {
+  // Extract everything after /upload/
+  const match = location.match(/\/upload\/(.+)/);
+  return match?.[1] || location.split('/').pop() || '';
+};
+
+// Helper to create TUS upload with required metadata
+const createTusUpload = async (
+  accessToken: string,
+  options: {
+    filename?: string;
+    size?: number;
+    metadata?: Record<string, string>;
+  } = {},
+) => {
+  const defaultMetadata = {
+    filename: options.filename || 'test-image.png',
+    deviceAssetId: 'test-device-asset-1',
+    deviceId: 'test-device',
+    fileCreatedAt: new Date().toISOString(),
+    fileModifiedAt: new Date().toISOString(),
+    ...options.metadata,
+  };
+
+  const uploadLength = options.size ?? makeRandomImage().length;
+
+  return request(app)
+    .post('/upload')
+    .set('Authorization', `Bearer ${accessToken}`)
+    .set('Upload-Length', uploadLength.toString())
+    .set('Upload-Metadata', encodeMetadata(defaultMetadata))
+    .set('Tus-Resumable', '1.0.0');
+};
+
+// Helper to upload chunk via PATCH
+const uploadChunk = async (accessToken: string, uploadId: string, data: Buffer, offset: number = 0) => {
+  return request(app)
+    .patch(`/upload/${uploadId}`)
+    .set('Authorization', `Bearer ${accessToken}`)
+    .set('Content-Type', 'application/offset+octet-stream')
+    .set('Upload-Offset', offset.toString())
+    .set('Tus-Resumable', '1.0.0')
+    .send(data);
+};
+
+// Helper to get upload status via HEAD
+const getUploadStatus = async (accessToken: string, uploadId: string) => {
+  return request(app)
+    .head(`/upload/${uploadId}`)
+    .set('Authorization', `Bearer ${accessToken}`)
+    .set('Tus-Resumable', '1.0.0');
+};
+
+// Helper to delete/cancel upload
+const cancelUpload = async (accessToken: string, uploadId: string) => {
+  return request(app)
+    .delete(`/upload/${uploadId}`)
+    .set('Authorization', `Bearer ${accessToken}`)
+    .set('Tus-Resumable', '1.0.0');
+};
+
+describe('/upload (TUS protocol)', () => {
+  let admin: LoginResponseDto;
+  let user: LoginResponseDto;
+  let quotaUser: LoginResponseDto;
+
+  beforeAll(async () => {
+    await utils.resetDatabase();
+    admin = await utils.adminSetup({ onboarding: false });
+    user = await utils.userSetup(admin.accessToken, createUserDto.create('tus-user'));
+    quotaUser = await utils.userSetup(admin.accessToken, createUserDto.userQuota);
+  });
+
+  describe('POST /upload (create upload)', () => {
+    it('should require authentication', async () => {
+      const { status, body } = await request(app)
+        .post('/upload')
+        .set('Upload-Length', '1000')
+        .set('Upload-Metadata', encodeMetadata({ filename: 'test.png' }))
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(status).toBe(401);
+      expect(body).toEqual(errorDto.unauthorized);
+    });
+
+    it('should create upload with valid metadata', async () => {
+      const imageData = makeRandomImage();
+      const response = await createTusUpload(user.accessToken, {
+        filename: 'test-image.png',
+        size: imageData.length,
+      });
+
+      expect(response.status).toBe(201);
+      expect(response.headers['location']).toBeDefined();
+      expect(response.headers['tus-resumable']).toBe('1.0.0');
+
+      const location = response.headers['location'];
+      expect(location).toContain('/upload/');
+      // Upload ID should have nested folder structure: userId/xx/yy/uuid
+      const uploadId = extractUploadId(location);
+      expect(uploadId.split('/').length).toBe(4);
+    });
+
+    it('should reject without required metadata: filename', async () => {
+      const { status, text } = await request(app)
+        .post('/upload')
+        .set('Authorization', `Bearer ${user.accessToken}`)
+        .set('Upload-Length', '1000')
+        .set(
+          'Upload-Metadata',
+          encodeMetadata({
+            deviceAssetId: 'test-device-asset-1',
+            deviceId: 'test-device',
+            fileCreatedAt: new Date().toISOString(),
+            fileModifiedAt: new Date().toISOString(),
+          }),
+        )
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(status).toBe(400);
+      expect(text).toContain('Missing required metadata: filename');
+    });
+
+    it('should reject without required metadata: deviceAssetId', async () => {
+      const { status, text } = await request(app)
+        .post('/upload')
+        .set('Authorization', `Bearer ${user.accessToken}`)
+        .set('Upload-Length', '1000')
+        .set(
+          'Upload-Metadata',
+          encodeMetadata({
+            filename: 'test.png',
+            deviceId: 'test-device',
+            fileCreatedAt: new Date().toISOString(),
+            fileModifiedAt: new Date().toISOString(),
+          }),
+        )
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(status).toBe(400);
+      expect(text).toContain('Missing required metadata: deviceAssetId');
+    });
+
+    it('should reject without required metadata: deviceId', async () => {
+      const { status, text } = await request(app)
+        .post('/upload')
+        .set('Authorization', `Bearer ${user.accessToken}`)
+        .set('Upload-Length', '1000')
+        .set(
+          'Upload-Metadata',
+          encodeMetadata({
+            filename: 'test.png',
+            deviceAssetId: 'test-device-asset-1',
+            fileCreatedAt: new Date().toISOString(),
+            fileModifiedAt: new Date().toISOString(),
+          }),
+        )
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(status).toBe(400);
+      expect(text).toContain('Missing required metadata: deviceId');
+    });
+
+    it('should reject unsupported file types', async () => {
+      const { status, text } = await createTusUpload(user.accessToken, {
+        filename: 'malicious.exe',
+        size: 1000,
+      });
+
+      expect(status).toBe(400);
+      expect(text).toContain('Unsupported file type');
+    });
+
+    it('should reject upload if quota exceeded', async () => {
+      const imageData = Buffer.alloc(600); // Exceeds quota of 512 bytes
+      const { status, text } = await createTusUpload(quotaUser.accessToken, {
+        filename: 'large-file.png',
+        size: imageData.length,
+      });
+
+      expect(status).toBe(400);
+      expect(text).toContain('Quota has been exceeded!');
+    });
+
+    it('should accept various supported image types', async () => {
+      const supportedTypes = ['test.jpg', 'test.jpeg', 'test.png', 'test.webp', 'test.heic', 'test.avif'];
+
+      for (const filename of supportedTypes) {
+        const response = await createTusUpload(user.accessToken, {
+          filename,
+          size: 1000,
+          metadata: {
+            deviceAssetId: `test-${filename}`,
+          },
+        });
+
+        expect(response.status).toBe(201);
+        expect(response.headers['location']).toBeDefined();
+      }
+    });
+
+    it('should accept video file types', async () => {
+      const response = await createTusUpload(user.accessToken, {
+        filename: 'test-video.mp4',
+        size: 1000,
+        metadata: {
+          deviceAssetId: 'test-video-1',
+          duration: '10.5',
+        },
+      });
+
+      expect(response.status).toBe(201);
+      expect(response.headers['location']).toBeDefined();
+    });
+  });
+
+  describe('PATCH /upload/:id (upload chunks)', () => {
+    it('should require authentication', async () => {
+      const { status, body } = await request(app)
+        .patch(`/upload/${uuidDto.notFound}`)
+        .set('Content-Type', 'application/offset+octet-stream')
+        .set('Upload-Offset', '0')
+        .set('Tus-Resumable', '1.0.0')
+        .send(Buffer.from('test'));
+
+      expect(status).toBe(401);
+      expect(body).toEqual(errorDto.unauthorized);
+    });
+
+    it('should accept chunk uploads', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'chunk-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'chunk-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
+
+      expect(patchResponse.status).toBe(204);
+      expect(patchResponse.headers['upload-offset']).toBe(imageData.length.toString());
+      expect(patchResponse.headers['tus-resumable']).toBe('1.0.0');
+    });
+
+    it('should track upload progress with Upload-Offset header', async () => {
+      const imageData = makeRandomImage();
+      const halfLength = Math.floor(imageData.length / 2);
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'progress-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'progress-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const firstChunk = imageData.subarray(0, halfLength);
+      const firstPatch = await uploadChunk(user.accessToken, uploadId, firstChunk, 0);
+
+      expect(firstPatch.status).toBe(204);
+      expect(firstPatch.headers['upload-offset']).toBe(halfLength.toString());
+
+      const secondChunk = imageData.subarray(halfLength);
+      const secondPatch = await uploadChunk(user.accessToken, uploadId, secondChunk, halfLength);
+
+      expect(secondPatch.status).toBe(204);
+      expect(secondPatch.headers['upload-offset']).toBe(imageData.length.toString());
+    });
+
+    it('should complete upload and return asset ID', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'complete-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'complete-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
+
+      expect(patchResponse.status).toBe(204);
+      expect(patchResponse.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+      expect(assetId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.id).toBe(assetId);
+      expect(asset.originalFileName).toBe('complete-test.png');
+    });
+
+    it('should handle multiple chunks correctly', async () => {
+      const imageData = makeRandomImage();
+      const chunkSize = Math.floor(imageData.length / 3);
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'multi-chunk-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'multi-chunk-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      let offset = 0;
+      const chunk1 = imageData.subarray(0, chunkSize);
+      const patch1 = await uploadChunk(user.accessToken, uploadId, chunk1, offset);
+      expect(patch1.status).toBe(204);
+      offset += chunkSize;
+
+      const chunk2 = imageData.subarray(chunkSize, chunkSize * 2);
+      const patch2 = await uploadChunk(user.accessToken, uploadId, chunk2, offset);
+      expect(patch2.status).toBe(204);
+      offset += chunkSize;
+
+      const chunk3 = imageData.subarray(chunkSize * 2);
+      const patch3 = await uploadChunk(user.accessToken, uploadId, chunk3, offset);
+      expect(patch3.status).toBe(204);
+      expect(patch3.headers['upload-offset']).toBe(imageData.length.toString());
+      expect(patch3.headers['x-immich-asset-id']).toBeDefined();
+    });
+
+    it('should upload real image file with metadata extraction', async () => {
+      const filepath = join(testAssetDir, 'formats/png/density_plot.png');
+      const imageData = await readFile(filepath);
+      const filename = basename(filepath);
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename,
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'real-image-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
+
+      expect(patchResponse.status).toBe(204);
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+      expect(assetId).toBeDefined();
+
+      await expect
+        .poll(() => utils.getAssetInfo(user.accessToken, assetId), { timeout: 10_000 })
+        .toMatchObject({ exifInfo: { exifImageWidth: 800, exifImageHeight: 800 } });
+    });
+  });
+
+  describe('HEAD /upload/:id (get upload status)', () => {
+    it('should require authentication', async () => {
+      const { status } = await request(app).head(`/upload/${uuidDto.notFound}`).set('Tus-Resumable', '1.0.0');
+
+      expect(status).toBe(401);
+    });
+
+    it('should return current upload offset', async () => {
+      const imageData = makeRandomImage();
+      const halfLength = Math.floor(imageData.length / 2);
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'head-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'head-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const headResponse1 = await getUploadStatus(user.accessToken, uploadId);
+      expect(headResponse1.status).toBe(200);
+      expect(headResponse1.headers['upload-offset']).toBe('0');
+      expect(headResponse1.headers['upload-length']).toBe(imageData.length.toString());
+
+      const chunk = imageData.subarray(0, halfLength);
+      await uploadChunk(user.accessToken, uploadId, chunk, 0);
+
+      const headResponse2 = await getUploadStatus(user.accessToken, uploadId);
+      expect(headResponse2.status).toBe(200);
+      expect(headResponse2.headers['upload-offset']).toBe(halfLength.toString());
+      expect(headResponse2.headers['upload-length']).toBe(imageData.length.toString());
+      expect(headResponse2.headers['x-immich-asset-id']).toBeUndefined();
+      expect(headResponse2.headers['x-immich-duplicate']).toBeUndefined();
+    });
+
+    it('should return Upload-Length header', async () => {
+      const uploadLength = 5000;
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'length-test.png',
+        size: uploadLength,
+        metadata: {
+          deviceAssetId: 'length-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+      const headResponse = await getUploadStatus(user.accessToken, uploadId);
+
+      expect(headResponse.status).toBe(200);
+      expect(headResponse.headers['upload-length']).toBe(uploadLength.toString());
+      expect(headResponse.headers['tus-resumable']).toBe('1.0.0');
+    });
+
+    it('should return 404 for non-existent upload', async () => {
+      // Use a properly formatted but non-existent upload ID (userId/xx/yy/uuid)
+      const nonExistentUploadId = `${user.userId}/00/00/${uuidDto.notFound}`;
+      const headResponse = await getUploadStatus(user.accessToken, nonExistentUploadId);
+      expect(headResponse.status).toBe(404);
+    });
+  });
+
+  describe('DELETE /upload/:id (cancel upload)', () => {
+    it('should require authentication', async () => {
+      const { status, body } = await request(app).delete(`/upload/${uuidDto.notFound}`).set('Tus-Resumable', '1.0.0');
+
+      expect(status).toBe(401);
+      expect(body).toEqual(errorDto.unauthorized);
+    });
+
+    it('should cancel and clean up upload', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'delete-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'delete-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const chunk = imageData.subarray(0, Math.floor(imageData.length / 2));
+      await uploadChunk(user.accessToken, uploadId, chunk, 0);
+
+      const deleteResponse = await cancelUpload(user.accessToken, uploadId);
+      expect(deleteResponse.status).toBe(204);
+
+      const headResponse = await getUploadStatus(user.accessToken, uploadId);
+      expect(headResponse.status).toBe(404);
+    });
+
+    it('should protect the completed asset and expose its ID to the owner', async () => {
+      const image = makeRandomImage();
+      const creation = await createTusUpload(user.accessToken, {
+        filename: 'completed.png',
+        size: image.length,
+      });
+      const uploadId = extractUploadId(creation.headers['location']);
+      const completion = await uploadChunk(user.accessToken, uploadId, image);
+      const assetId = completion.headers['x-immich-asset-id'];
+
+      expect(completion.status).toBe(204);
+      expect(assetId).toBeDefined();
+      expect(completion.headers['x-immich-duplicate']).toBe('false');
+
+      const head = await getUploadStatus(user.accessToken, uploadId);
+      expect(head.status).toBe(200);
+      expect(head.headers['upload-offset']).toBe(String(image.length));
+      expect(head.headers['x-immich-asset-id']).toBe(assetId);
+      expect(head.headers['x-immich-duplicate']).toBe('false');
+
+      const otherUserHead = await getUploadStatus(admin.accessToken, uploadId);
+      expect(otherUserHead.status).toBe(403);
+      expect(otherUserHead.headers['x-immich-asset-id']).toBeUndefined();
+
+      const termination = await cancelUpload(user.accessToken, uploadId);
+      expect(termination.status).toBe(400);
+
+      const original = await request(app)
+        .get(`/assets/${assetId}/original`)
+        .set('Authorization', `Bearer ${user.accessToken}`);
+      expect(original.status).toBe(200);
+      expect(original.body).toEqual(image);
+    });
+
+    it('should return 404 for non-existent upload', async () => {
+      // Use a properly formatted but non-existent upload ID (userId/xx/yy/uuid)
+      const nonExistentUploadId = `${user.userId}/00/00/${uuidDto.notFound}`;
+      const deleteResponse = await cancelUpload(user.accessToken, nonExistentUploadId);
+      expect(deleteResponse.status).toBe(404);
+    });
+  });
+
+  describe('Small file uploads (under 50MB - single request)', () => {
+    it('should upload small file in a single request', async () => {
+      // Create a 10MB buffer (well under 50MB threshold)
+      const fileSize = 10 * 1024 * 1024;
+      const smallData = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        smallData[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'small-file-test.jpg',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'small-file-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // Upload entire file in single request (no chunking needed)
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, smallData, 0);
+
+      expect(patchResponse.status).toBe(204);
+      expect(patchResponse.headers['upload-offset']).toBe(fileSize.toString());
+      expect(patchResponse.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.originalFileName).toBe('small-file-test.jpg');
+    }, 30_000);
+
+    it('should upload file just under 50MB threshold in single request', async () => {
+      // Create a 49MB buffer (just under 50MB threshold)
+      const fileSize = 49 * 1024 * 1024;
+      const data = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        data[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'under-threshold-test.jpg',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'under-threshold-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // Upload entire file in single request
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, data, 0);
+
+      expect(patchResponse.status).toBe(204);
+      expect(patchResponse.headers['upload-offset']).toBe(fileSize.toString());
+      expect(patchResponse.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.originalFileName).toBe('under-threshold-test.jpg');
+    }, 60_000);
+  });
+
+  describe('Large file uploads (over 50MB - chunked)', () => {
+    it('should handle large file upload with multiple 50MB chunks', async () => {
+      // Create a 120MB buffer to test chunked upload behavior (exceeds 50MB threshold)
+      const fileSize = 120 * 1024 * 1024;
+      const largeData = Buffer.alloc(fileSize);
+      // Fill with random-ish data to avoid compression issues
+      for (let i = 0; i < fileSize; i += 1024) {
+        largeData[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'large-file-test.jpg',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'large-file-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      let offset = 0;
+      let lastResponse;
+      let chunkCount = 0;
+
+      while (offset < fileSize) {
+        const end = Math.min(offset + CHUNK_SIZE, fileSize);
+        const chunk = largeData.subarray(offset, end);
+
+        lastResponse = await uploadChunk(user.accessToken, uploadId, chunk, offset);
+        expect(lastResponse.status).toBe(204);
+        expect(lastResponse.headers['upload-offset']).toBe(end.toString());
+
+        offset = end;
+        chunkCount++;
+      }
+
+      // Verify we actually used multiple chunks (120MB / 50MB = 3 chunks)
+      expect(chunkCount).toBe(3);
+
+      // Verify upload completed successfully
+      expect(lastResponse!.headers['x-immich-asset-id']).toBeDefined();
+      const assetId = lastResponse!.headers['x-immich-asset-id'];
+
+      // Verify asset was created
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.id).toBe(assetId);
+      expect(asset.originalFileName).toBe('large-file-test.jpg');
+    }, 120_000); // 120 second timeout for large upload
+
+    it('should handle file just over 50MB threshold with 2 chunks', async () => {
+      // Create a 75MB buffer (just over 50MB, requires 2 chunks)
+      const fileSize = 75 * 1024 * 1024;
+      const data = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        data[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'over-threshold-test.jpg',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'over-threshold-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // First chunk: 50MB
+      const chunk1 = data.subarray(0, CHUNK_SIZE);
+      const response1 = await uploadChunk(user.accessToken, uploadId, chunk1, 0);
+      expect(response1.status).toBe(204);
+      expect(response1.headers['upload-offset']).toBe(CHUNK_SIZE.toString());
+      // Should not have asset ID yet (upload not complete)
+      expect(response1.headers['x-immich-asset-id']).toBeUndefined();
+
+      // Second chunk: remaining 25MB
+      const chunk2 = data.subarray(CHUNK_SIZE);
+      const response2 = await uploadChunk(user.accessToken, uploadId, chunk2, CHUNK_SIZE);
+      expect(response2.status).toBe(204);
+      expect(response2.headers['upload-offset']).toBe(fileSize.toString());
+      expect(response2.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = response2.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.originalFileName).toBe('over-threshold-test.jpg');
+    }, 90_000);
+
+    it('should resume large file upload after interruption', async () => {
+      // Create a 100MB buffer
+      const fileSize = 100 * 1024 * 1024;
+      const largeData = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        largeData[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'resume-large-test.jpg',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'resume-large-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // Upload first 50MB chunk
+      const firstChunk = largeData.subarray(0, CHUNK_SIZE);
+      await uploadChunk(user.accessToken, uploadId, firstChunk, 0);
+
+      // Simulate "interruption" - check status via HEAD
+      const statusResponse = await getUploadStatus(user.accessToken, uploadId);
+      expect(statusResponse.status).toBe(200);
+      expect(statusResponse.headers['upload-offset']).toBe(CHUNK_SIZE.toString());
+
+      // Resume upload from where we left off
+      const offset = Number.parseInt(statusResponse.headers['upload-offset']);
+      const remainingData = largeData.subarray(offset);
+      const resumeResponse = await uploadChunk(user.accessToken, uploadId, remainingData, offset);
+
+      expect(resumeResponse.status).toBe(204);
+      expect(resumeResponse.headers['upload-offset']).toBe(fileSize.toString());
+      expect(resumeResponse.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = resumeResponse.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset.originalFileName).toBe('resume-large-test.jpg');
+    }, 90_000);
+
+    it('should resume upload after partial chunk failure', async () => {
+      // Create a 150MB buffer (3 full chunks)
+      const fileSize = 150 * 1024 * 1024;
+      const largeData = Buffer.alloc(fileSize);
+      for (let i = 0; i < fileSize; i += 1024) {
+        largeData[i] = i % 256;
+      }
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'failure-resume-test.jpg',
+        size: fileSize,
+        metadata: {
+          deviceAssetId: 'failure-resume-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // Upload first chunk successfully (50MB)
+      const chunk1 = largeData.subarray(0, CHUNK_SIZE);
+      const response1 = await uploadChunk(user.accessToken, uploadId, chunk1, 0);
+      expect(response1.status).toBe(204);
+
+      // Upload second chunk successfully (50MB)
+      const chunk2 = largeData.subarray(CHUNK_SIZE, CHUNK_SIZE * 2);
+      const response2 = await uploadChunk(user.accessToken, uploadId, chunk2, CHUNK_SIZE);
+      expect(response2.status).toBe(204);
+
+      // Simulate failure recovery: check status via HEAD to get current offset
+      const statusAfterPartial = await getUploadStatus(user.accessToken, uploadId);
+      expect(statusAfterPartial.status).toBe(200);
+      const currentOffset = Number.parseInt(statusAfterPartial.headers['upload-offset']);
+      expect(currentOffset).toBe(CHUNK_SIZE * 2); // Should be at 100MB
+
+      // Resume from the correct offset (simulating client recovery after failure)
+      const chunk3 = largeData.subarray(currentOffset);
+      const response3 = await uploadChunk(user.accessToken, uploadId, chunk3, currentOffset);
+      expect(response3.status).toBe(204);
+      expect(response3.headers['x-immich-asset-id']).toBeDefined();
+
+      // Verify the asset was created correctly
+      const assetId = response3.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.originalFileName).toBe('failure-resume-test.jpg');
+    }, 120_000);
+  });
+
+  describe('Resumable upload flow', () => {
+    it('should resume interrupted upload', async () => {
+      const imageData = makeRandomImage();
+      const chunkSize = Math.floor(imageData.length / 3);
+
+      // Create upload
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'resume-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'resume-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const chunk1 = imageData.subarray(0, chunkSize);
+      await uploadChunk(user.accessToken, uploadId, chunk1, 0);
+
+      const statusResponse = await getUploadStatus(user.accessToken, uploadId);
+      expect(statusResponse.headers['upload-offset']).toBe(chunkSize.toString());
+
+      const offset = Number.parseInt(statusResponse.headers['upload-offset']);
+      const remainingData = imageData.subarray(offset);
+      const resumeResponse = await uploadChunk(user.accessToken, uploadId, remainingData, offset);
+
+      expect(resumeResponse.status).toBe(204);
+      expect(resumeResponse.headers['upload-offset']).toBe(imageData.length.toString());
+      expect(resumeResponse.headers['x-immich-asset-id']).toBeDefined();
+
+      const assetId = resumeResponse.headers['x-immich-asset-id'];
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset).toBeDefined();
+      expect(asset.originalFileName).toBe('resume-test.png');
+    });
+
+    it('should handle concurrent uploads', async () => {
+      const upload1Data = makeRandomImage();
+      const upload2Data = makeRandomImage();
+
+      // Create two uploads
+      const [create1, create2] = await Promise.all([
+        createTusUpload(user.accessToken, {
+          filename: 'concurrent-1.png',
+          size: upload1Data.length,
+          metadata: {
+            deviceAssetId: 'concurrent-test-1',
+          },
+        }),
+        createTusUpload(user.accessToken, {
+          filename: 'concurrent-2.png',
+          size: upload2Data.length,
+          metadata: {
+            deviceAssetId: 'concurrent-test-2',
+          },
+        }),
+      ]);
+
+      const uploadId1 = extractUploadId(create1.headers['location']);
+      const uploadId2 = extractUploadId(create2.headers['location']);
+
+      const [patch1, patch2] = await Promise.all([
+        uploadChunk(user.accessToken, uploadId1, upload1Data, 0),
+        uploadChunk(user.accessToken, uploadId2, upload2Data, 0),
+      ]);
+
+      expect(patch1.status).toBe(204);
+      expect(patch2.status).toBe(204);
+
+      const assetId1 = patch1.headers['x-immich-asset-id'];
+      const assetId2 = patch2.headers['x-immich-asset-id'];
+
+      expect(assetId1).toBeDefined();
+      expect(assetId2).toBeDefined();
+      expect(assetId1).not.toBe(assetId2);
+
+      const [asset1, asset2] = await Promise.all([
+        utils.getAssetInfo(user.accessToken, assetId1),
+        utils.getAssetInfo(user.accessToken, assetId2),
+      ]);
+
+      expect(asset1.originalFileName).toBe('concurrent-1.png');
+      expect(asset2.originalFileName).toBe('concurrent-2.png');
+    });
+
+    it('should handle duplicate uploads', async () => {
+      const imageData = makeRandomImage();
+
+      // Upload first time
+      const create1 = await createTusUpload(user.accessToken, {
+        filename: 'duplicate-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'duplicate-test-1',
+        },
+      });
+
+      const uploadId1 = extractUploadId(create1.headers['location']);
+      const patch1 = await uploadChunk(user.accessToken, uploadId1, imageData, 0);
+      const assetId1 = patch1.headers['x-immich-asset-id'];
+
+      const create2 = await createTusUpload(user.accessToken, {
+        filename: 'duplicate-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'duplicate-test-2',
+        },
+      });
+
+      const uploadId2 = extractUploadId(create2.headers['location']);
+      const patch2 = await uploadChunk(user.accessToken, uploadId2, imageData, 0);
+      const assetId2 = patch2.headers['x-immich-asset-id'];
+
+      expect(assetId1).toBe(assetId2);
+      expect(patch2.headers['x-immich-duplicate']).toBe('true');
+
+      const head = await getUploadStatus(user.accessToken, uploadId2);
+      expect(head.status).toBe(200);
+      expect(head.headers['x-immich-asset-id']).toBe(assetId1);
+      expect(head.headers['x-immich-duplicate']).toBe('true');
+    });
+  });
+
+  it('should attach a streamed XMP sidecar and preserve it after upload completion', async () => {
+    const image = makeRandomImage();
+    const description = 'File metadata sent separately from the resumable upload headers';
+    const sidecar = Buffer.from(`<x:xmpmeta xmlns:x="adobe:ns:meta/">
+      <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+        <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <dc:description><rdf:Alt><rdf:li xml:lang="x-default">${description}</rdf:li></rdf:Alt></dc:description>
+        </rdf:Description>
+      </rdf:RDF>
+      <!-- ${' '.repeat(20 * 1024)} -->
+    </x:xmpmeta>`);
+    const creation = await createTusUpload(user.accessToken, {
+      filename: 'with-sidecar.png',
+      size: image.length,
+      metadata: { sidecarRequired: 'true' },
+    });
+    const uploadId = extractUploadId(creation.headers.location);
+    const putSidecar = (accessToken: string) =>
+      request(app)
+        .put(`/upload/${uploadId}/sidecar`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .set('Content-Type', 'application/octet-stream')
+        .set('Content-Length', String(sidecar.length))
+        .send(sidecar);
+
+    await putSidecar(admin.accessToken).expect(403);
+    await putSidecar(user.accessToken).expect(204);
+    await putSidecar(user.accessToken).expect(204);
+
+    const completion = await uploadChunk(user.accessToken, uploadId, image);
+    expect(completion.status).toBe(204);
+    await putSidecar(user.accessToken).expect(409);
+    await expect
+      .poll(() => utils.getAssetInfo(user.accessToken, completion.headers['x-immich-asset-id']), { timeout: 10_000 })
+      .toMatchObject({ exifInfo: { description } });
+  });
+
+  describe('Advanced metadata handling', () => {
+    it('should handle favorite flag', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'favorite-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'favorite-test-1',
+          isFavorite: 'true',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset.isFavorite).toBe(true);
+    });
+
+    it('should handle visibility setting', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'archive-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'archive-test-1',
+          visibility: 'ARCHIVE',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(asset.isArchived).toBe(true);
+    });
+
+    it('should handle video duration metadata', async () => {
+      const motionPhoto = await readFile(join(testAssetDir, 'formats/motionphoto/pixel-8a.jpg'));
+      // The embedded MP4 starts with an ftyp box and its four-byte length.
+      const boxType = motionPhoto.lastIndexOf('ftypisom');
+      expect(boxType).toBeGreaterThan(4);
+      const videoData = motionPhoto.subarray(boxType - 4);
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'video.mp4',
+        size: videoData.length,
+        metadata: {
+          deviceAssetId: 'video-duration-test-1',
+          duration: '15.5',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, videoData, 0);
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+
+      expect(patchResponse.status).toBe(204);
+      await expect
+        .poll(() => utils.getAssetInfo(user.accessToken, assetId), { timeout: 10_000 })
+        .toMatchObject({
+          type: AssetTypeEnum.Video,
+          checksum: '7YdY+WF0h+CXHbiXpi0HiCMTTjs=',
+          duration: expect.stringMatching(/^00:00:01\./),
+        });
+    });
+
+    it('should handle custom file timestamps', async () => {
+      const imageData = makeRandomImage();
+      const customCreatedAt = new Date('2020-01-15T10:30:00Z').toISOString();
+      const customModifiedAt = new Date('2020-01-15T11:30:00Z').toISOString();
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'timestamp-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'timestamp-test-1',
+          fileCreatedAt: customCreatedAt,
+          fileModifiedAt: customModifiedAt,
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
+      const assetId = patchResponse.headers['x-immich-asset-id'];
+
+      const asset = await utils.getAssetInfo(user.accessToken, assetId);
+      expect(new Date(asset.fileCreatedAt).toISOString()).toBe(customCreatedAt);
+    });
+  });
+
+  describe('OPTIONS /upload (CORS preflight)', () => {
+    it('should handle OPTIONS request for CORS', async () => {
+      const origin = 'https://client.example';
+      const response = await request(app)
+        .options('/upload')
+        .set('Origin', origin)
+        .set('Access-Control-Request-Method', 'POST')
+        .set('Access-Control-Request-Headers', 'authorization,upload-length,upload-metadata,tus-resumable');
+
+      expect(response.status).toBe(204);
+      expect(response.headers['tus-version']).toBe('1.0.0');
+      expect(response.headers['tus-extension']).not.toContain('creation-defer-length');
+      expect(response.headers['access-control-allow-origin']).toBe(origin);
+      expect(response.headers['access-control-allow-methods']).toContain('POST');
+      expect(response.headers['access-control-allow-headers'].toLowerCase()).toContain('authorization');
+    });
+  });
+
+  describe('Negative test cases', () => {
+    it('should reject creation when the upload length is deferred', async () => {
+      const response = await request(app)
+        .post('/upload')
+        .set('Authorization', `Bearer ${quotaUser.accessToken}`)
+        .set('Tus-Resumable', '1.0.0')
+        .set('Upload-Defer-Length', '1')
+        .set(
+          'Upload-Metadata',
+          encodeMetadata({
+            filename: 'deferred.png',
+            deviceAssetId: 'deferred',
+            deviceId: 'test-device',
+          }),
+        );
+
+      expect(response.status).toBe(501);
+      expect(response.headers['location']).toBeUndefined();
+    });
+
+    it('should reject PATCH with incorrect offset', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'offset-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'offset-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 1000);
+
+      expect(patchResponse.status).toBe(409); // Conflict - offset mismatch
+    });
+
+    it("should reject access to another user's upload", async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'access-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'access-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const patchResponse = await uploadChunk(admin.accessToken, uploadId, imageData, 0);
+
+      expect(patchResponse.status).toBe(403); // Forbidden
+    });
+
+    it('should reject upload exceeding declared size', async () => {
+      const imageData = makeRandomImage();
+      const declaredSize = Math.floor(imageData.length / 2);
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'size-exceed-test.png',
+        size: declaredSize,
+        metadata: {
+          deviceAssetId: 'size-exceed-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const patchResponse = await uploadChunk(user.accessToken, uploadId, imageData, 0);
+
+      expect(patchResponse.status).toBe(413); // Payload too large
+    });
+
+    it('should reject PATCH without Upload-Offset header', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'no-offset-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'no-offset-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const response = await request(app)
+        .patch(`/upload/${uploadId}`)
+        .set('Authorization', `Bearer ${user.accessToken}`)
+        .set('Content-Type', 'application/offset+octet-stream')
+        .set('Tus-Resumable', '1.0.0')
+        .send(imageData);
+
+      // TUS library should reject with 400 (missing required header) or 403 (forbidden)
+      expect([400, 403]).toContain(response.status);
+    });
+
+    it('should reject POST without Upload-Length header', async () => {
+      const response = await request(app)
+        .post('/upload')
+        .set('Authorization', `Bearer ${user.accessToken}`)
+        .set(
+          'Upload-Metadata',
+          encodeMetadata({
+            filename: 'no-length-test.png',
+            deviceAssetId: 'no-length-test-1',
+            deviceId: 'test-device',
+            fileCreatedAt: new Date().toISOString(),
+            fileModifiedAt: new Date().toISOString(),
+          }),
+        )
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(response.status).toBe(400); // Bad request
+    });
+  });
+
+  describe('Authentication security', () => {
+    it('should reject upload creation with invalid token', async () => {
+      const response = await request(app)
+        .post('/upload')
+        .set('Authorization', 'Bearer invalid-token-12345')
+        .set('Upload-Length', '1000')
+        .set(
+          'Upload-Metadata',
+          encodeMetadata({
+            filename: 'auth-test.png',
+            deviceAssetId: 'auth-test-1',
+            deviceId: 'test-device',
+            fileCreatedAt: new Date().toISOString(),
+            fileModifiedAt: new Date().toISOString(),
+          }),
+        )
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(response.status).toBe(401);
+    });
+
+    it('should reject chunk upload with invalid token', async () => {
+      // First create a valid upload
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'auth-chunk-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'auth-chunk-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      // Try to upload chunk with invalid token
+      const patchResponse = await request(app)
+        .patch(`/upload/${uploadId}`)
+        .set('Authorization', 'Bearer invalid-token-12345')
+        .set('Content-Type', 'application/offset+octet-stream')
+        .set('Upload-Offset', '0')
+        .set('Tus-Resumable', '1.0.0')
+        .send(imageData);
+
+      expect(patchResponse.status).toBe(401);
+    });
+
+    it('should reject HEAD request with invalid token', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'auth-head-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'auth-head-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const headResponse = await request(app)
+        .head(`/upload/${uploadId}`)
+        .set('Authorization', 'Bearer invalid-token-12345')
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(headResponse.status).toBe(401);
+    });
+
+    it('should reject DELETE request with invalid token', async () => {
+      const imageData = makeRandomImage();
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'auth-delete-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'auth-delete-test-1',
+        },
+      });
+
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const deleteResponse = await request(app)
+        .delete(`/upload/${uploadId}`)
+        .set('Authorization', 'Bearer invalid-token-12345')
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(deleteResponse.status).toBe(401);
+    });
+
+    it('should reject upload without any authentication', async () => {
+      const response = await request(app)
+        .post('/upload')
+        .set('Upload-Length', '1000')
+        .set(
+          'Upload-Metadata',
+          encodeMetadata({
+            filename: 'no-auth-test.png',
+            deviceAssetId: 'no-auth-test-1',
+            deviceId: 'test-device',
+            fileCreatedAt: new Date().toISOString(),
+            fileModifiedAt: new Date().toISOString(),
+          }),
+        )
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(response.status).toBe(401);
+    });
+
+    it('should isolate uploads between users - user cannot access other user upload', async () => {
+      const imageData = makeRandomImage();
+
+      const createResponse = await createTusUpload(user.accessToken, {
+        filename: 'isolation-test.png',
+        size: imageData.length,
+        metadata: {
+          deviceAssetId: 'isolation-test-1',
+        },
+      });
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const patchResponse = await uploadChunk(admin.accessToken, uploadId, imageData, 0);
+      expect(patchResponse.status).toBe(403);
+
+      const headResponse = await request(app)
+        .head(`/upload/${uploadId}`)
+        .set('Authorization', `Bearer ${admin.accessToken}`)
+        .set('Tus-Resumable', '1.0.0');
+      expect(headResponse.status).toBe(403);
+
+      const deleteResponse = await request(app)
+        .delete(`/upload/${uploadId}`)
+        .set('Authorization', `Bearer ${admin.accessToken}`)
+        .set('Tus-Resumable', '1.0.0');
+      expect(deleteResponse.status).toBe(403);
+
+      const finalPatch = await uploadChunk(user.accessToken, uploadId, imageData, 0);
+      expect(finalPatch.status).toBe(204);
+      expect(finalPatch.headers['x-immich-asset-id']).toBeDefined();
+    });
+
+    it('should work with API key authentication', async () => {
+      const apiKey = await utils.createApiKey(user.accessToken, [Permission.All]);
+
+      const imageData = makeRandomImage();
+      const createResponse = await request(app)
+        .post('/upload')
+        .set('x-api-key', apiKey.secret)
+        .set('Upload-Length', imageData.length.toString())
+        .set(
+          'Upload-Metadata',
+          encodeMetadata({
+            filename: 'apikey-test.png',
+            deviceAssetId: 'apikey-test-1',
+            deviceId: 'test-device',
+            fileCreatedAt: new Date().toISOString(),
+            fileModifiedAt: new Date().toISOString(),
+          }),
+        )
+        .set('Tus-Resumable', '1.0.0');
+
+      expect(createResponse.status).toBe(201);
+      const uploadId = extractUploadId(createResponse.headers['location']);
+
+      const patchResponse = await request(app)
+        .patch(`/upload/${uploadId}`)
+        .set('x-api-key', apiKey.secret)
+        .set('Content-Type', 'application/offset+octet-stream')
+        .set('Upload-Offset', '0')
+        .set('Tus-Resumable', '1.0.0')
+        .send(imageData);
+
+      expect(patchResponse.status).toBe(204);
+      expect(patchResponse.headers['x-immich-asset-id']).toBeDefined();
+    });
+  });
+});

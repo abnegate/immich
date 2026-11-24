@@ -262,9 +262,9 @@ export class StorageTemplateService extends BaseService {
       const filenameWithoutExtension = path.basename(filename, path.extname(filename));
 
       const source = asset.originalPath;
-      let extension = path.extname(source).split('.').pop() as string;
+      let extension = path.extname(source).slice(1) || path.extname(asset.originalFileName).slice(1);
       const sanitized = sanitize(path.basename(filenameWithoutExtension, `.${extension}`));
-      extension = extension?.toLowerCase();
+      extension = extension.toLowerCase();
       const rootPath = StorageCore.getLibraryFolder({ id: asset.ownerId, storageLabel });
 
       switch (extension) {
@@ -322,7 +322,8 @@ export class StorageTemplateService extends BaseService {
         lensModel: asset.lensModel,
       });
       const fullPath = path.normalize(path.join(rootPath, storagePath));
-      let destination = `${fullPath}.${extension}`;
+      const suffix = extension ? `.${extension}` : '';
+      let destination = `${fullPath}${suffix}`;
 
       if (!fullPath.startsWith(rootPath)) {
         this.logger.warn(`Skipped attempt to access an invalid path: ${fullPath}. Path should start with ${rootPath}`);
@@ -347,8 +348,8 @@ export class StorageTemplateService extends BaseService {
        * The lines below will be used to check if the differences between the source and destination is only the
        * +7 suffix, and if so, it will be considered as already migrated.
        */
-      if (source.startsWith(fullPath) && source.endsWith(`.${extension}`)) {
-        const diff = source.replace(fullPath, '').replace(`.${extension}`, '');
+      if (source.startsWith(fullPath) && source.endsWith(suffix)) {
+        const diff = source.slice(fullPath.length, source.length - suffix.length);
         const hasDuplicationAnnotation = /^\+\d+$/.test(diff);
         if (hasDuplicationAnnotation) {
           return source;
@@ -364,7 +365,7 @@ export class StorageTemplateService extends BaseService {
         }
 
         duplicateCount++;
-        destination = `${fullPath}+${duplicateCount}.${extension}`;
+        destination = `${fullPath}+${duplicateCount}${suffix}`;
       }
 
       return destination;

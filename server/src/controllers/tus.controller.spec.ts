@@ -1,0 +1,197 @@
+import { Response } from 'express';
+import { TusController } from 'src/controllers/tus.controller';
+import { TusService } from 'src/services/tus.service';
+import request from 'supertest';
+import { ControllerContext, controllerSetup, mockBaseService } from 'test/utils';
+
+function respond(response: Response, status: number): Promise<void> {
+  response.status(status).send();
+  return Promise.resolve();
+}
+
+describe(TusController.name, () => {
+  let ctx: ControllerContext;
+  const service = mockBaseService(TusService);
+
+  beforeAll(async () => {
+    ctx = await controllerSetup(TusController, [{ provide: TusService, useValue: service }]);
+    return () => ctx.close();
+  });
+
+  beforeEach(() => {
+    service.resetAllMocks();
+    ctx.reset();
+  });
+
+  describe('ALL /upload', () => {
+    it('should be an authenticated route', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
+      await request(ctx.getHttpServer()).post('/upload');
+      expect(ctx.authenticate).toHaveBeenCalled();
+    });
+
+    it('should call service.handleTusUpload for POST', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
+
+      await request(ctx.getHttpServer())
+        .post('/upload')
+        .set('Upload-Length', '1000')
+        .set('Upload-Metadata', 'filename dGVzdC5qcGc=');
+
+      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
+      const [, req] = service.handleTusUpload.mock.calls[0];
+      expect(req.method).toBe('POST');
+    });
+
+    it('should call service.handleTusUpload for PATCH', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 204));
+
+      await request(ctx.getHttpServer())
+        .patch('/upload')
+        .set('Upload-Offset', '0')
+        .set('Content-Type', 'application/offset+octet-stream');
+
+      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
+      const [, req] = service.handleTusUpload.mock.calls[0];
+      expect(req.method).toBe('PATCH');
+    });
+
+    it('should call service.handleTusUpload for HEAD', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
+
+      await request(ctx.getHttpServer()).head('/upload');
+
+      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
+      const [, req] = service.handleTusUpload.mock.calls[0];
+      expect(req.method).toBe('HEAD');
+    });
+
+    it('should call service.handleTusUpload for DELETE', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 204));
+
+      await request(ctx.getHttpServer()).delete('/upload');
+
+      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
+      const [, req] = service.handleTusUpload.mock.calls[0];
+      expect(req.method).toBe('DELETE');
+    });
+
+    it('should handle OPTIONS without authentication', async () => {
+      service.handleTusOptions.mockImplementation((_request, response) => respond(response, 204));
+
+      await request(ctx.getHttpServer()).options('/upload');
+
+      expect(ctx.authenticate).not.toHaveBeenCalled();
+      expect(service.handleTusOptions).toHaveBeenCalledTimes(1);
+      const [httpRequest] = service.handleTusOptions.mock.calls[0];
+      expect(httpRequest.method).toBe('OPTIONS');
+    });
+
+    it('should handle service errors', async () => {
+      service.handleTusUpload.mockRejectedValue(new Error('Service error'));
+
+      const { status } = await request(ctx.getHttpServer()).post('/upload');
+
+      expect(status).toBe(500);
+    });
+  });
+
+  it('should route authenticated sidecar staging to the sidecar service', async () => {
+    const { status } = await request(ctx.getHttpServer()).put('/upload/owner/f1/f2/upload/sidecar');
+    expect(status).toBe(204);
+    expect(ctx.authenticate).toHaveBeenCalled();
+    expect(service.stageSidecar).toHaveBeenCalledTimes(1);
+    expect(service.handleTusUpload).not.toHaveBeenCalled();
+  });
+
+  describe('ALL /upload/*', () => {
+    // Note: With the wildcard route @All('*'), the upload ID is extracted from the URL
+    // by the TUS library's getFileIdFromRequest, not from req.params
+    const uploadId = 'test-upload-id-123';
+
+    it('should be an authenticated route', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
+      await request(ctx.getHttpServer()).post(`/upload/${uploadId}`);
+      expect(ctx.authenticate).toHaveBeenCalled();
+    });
+
+    it('should call service.handleTusUpload with upload ID in URL for POST', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
+
+      await request(ctx.getHttpServer()).post(`/upload/${uploadId}`).set('Upload-Length', '1000');
+
+      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
+      const [, req] = service.handleTusUpload.mock.calls[0];
+      expect(req.method).toBe('POST');
+      expect(req.url).toContain(uploadId);
+    });
+
+    it('should call service.handleTusUpload for PATCH with upload ID', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 204));
+
+      await request(ctx.getHttpServer())
+        .patch(`/upload/${uploadId}`)
+        .set('Upload-Offset', '500')
+        .set('Content-Type', 'application/offset+octet-stream')
+        .send(Buffer.from('test data'));
+
+      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
+      const [, req] = service.handleTusUpload.mock.calls[0];
+      expect(req.method).toBe('PATCH');
+      expect(req.url).toContain(uploadId);
+    });
+
+    it('should call service.handleTusUpload for HEAD with upload ID', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
+
+      await request(ctx.getHttpServer()).head(`/upload/${uploadId}`);
+
+      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
+      const [, req] = service.handleTusUpload.mock.calls[0];
+      expect(req.method).toBe('HEAD');
+      expect(req.url).toContain(uploadId);
+    });
+
+    it('should call service.handleTusUpload for DELETE with upload ID', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 204));
+
+      await request(ctx.getHttpServer()).delete(`/upload/${uploadId}`);
+
+      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
+      const [, req] = service.handleTusUpload.mock.calls[0];
+      expect(req.method).toBe('DELETE');
+      expect(req.url).toContain(uploadId);
+    });
+
+    it('should handle upload-specific OPTIONS without authentication', async () => {
+      service.handleTusOptions.mockImplementation((_request, response) => respond(response, 204));
+
+      await request(ctx.getHttpServer()).options(`/upload/${uploadId}`);
+
+      expect(ctx.authenticate).not.toHaveBeenCalled();
+      expect(service.handleTusOptions).toHaveBeenCalledTimes(1);
+      const [httpRequest] = service.handleTusOptions.mock.calls[0];
+      expect(httpRequest.method).toBe('OPTIONS');
+      expect(httpRequest.url).toContain(uploadId);
+    });
+
+    it('should handle service errors', async () => {
+      service.handleTusUpload.mockRejectedValue(new Error('Service error'));
+
+      const { status } = await request(ctx.getHttpServer()).patch(`/upload/${uploadId}`);
+
+      expect(status).toBe(500);
+    });
+
+    it('should handle different upload IDs', async () => {
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
+      const differentId = 'different-upload-id-456';
+
+      await request(ctx.getHttpServer()).head(`/upload/${differentId}`);
+
+      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
+      const [, req] = service.handleTusUpload.mock.calls[0];
+      expect(req.url).toContain(differentId);
+    });
+  });
+});

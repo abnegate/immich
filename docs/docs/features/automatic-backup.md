@@ -1,6 +1,6 @@
 # Automatic Backup
 
-Immich supports uploading photos and videos from your mobile device to the server automatically.
+Immich can automatically upload photos and videos from your mobile device. Large files can use [resumable uploads](https://tus.io/protocols/resumable-upload) when the server supports them.
 
 ---
 
@@ -26,6 +26,13 @@ If background backup is enabled. The app will periodically check if there are an
 
 - The app must be in the background for the backup worker to start running.
 - If you reopen the app and the first page you see is the backup page, the counts will not reflect the background uploaded result. You have to navigate out of the page and come back to see the updated counts.
+
+#### Resumable Uploads
+
+When the server supports [tus](https://tus.io/protocols/resumable-upload), foreground and background backup use it for files of at least 50 MiB.
+
+- Android sends chunks of up to 10 MiB and can resume a previously started upload.
+- iOS sends chunks of up to 50 MiB and can retry an interrupted transfer while the current app process is running.
 
 #### Android
 

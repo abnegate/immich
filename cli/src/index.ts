@@ -87,6 +87,11 @@ program
       .default(false)
       .implies({ progress: false }),
   )
+  .addOption(
+    new Option('--resumable', 'Use resumable uploads for files of at least 50 MiB')
+      .env('IMMICH_RESUMABLE_UPLOAD')
+      .default(false),
+  )
   .argument('[paths...]', 'One or more paths to assets to be uploaded')
   .action((paths, options) => upload(paths, program.opts(), options));
 

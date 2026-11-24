@@ -25,6 +25,7 @@ export const newAssetRepositoryMock = (): Mocked<RepositoryInterface<AssetReposi
     getLibraryAssetCount: vitest.fn(),
     updateAll: vitest.fn(),
     getByLibraryIdAndOriginalPath: vitest.fn(),
+    hasOriginal: vitest.fn().mockResolvedValue(false),
     deleteAll: vitest.fn(),
     update: vitest.fn(),
     remove: vitest.fn(),

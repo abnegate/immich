@@ -1,8 +1,7 @@
 import type { TimelineAsset } from '$lib/managers/timeline-manager/types';
-import { locale } from '$lib/stores/preferences.store';
 import { fromTimelinePlainDateTime } from '$lib/utils/timeline-util';
 import { t } from 'svelte-i18n';
-import { derived, get } from 'svelte/store';
+import { derived } from 'svelte/store';
 
 /**
  * Calculate thumbnail size based on number of assets and viewport width
@@ -40,9 +39,10 @@ export function getThumbnailSize(assetCount: number, viewWidth: number): number 
 
 export const getAltText = derived(t, ($t) => {
   return (asset: TimelineAsset) => {
-    const date = fromTimelinePlainDateTime(asset.localDateTime).toJSDate().toLocaleString(get(locale), {
-      dateStyle: 'long',
-      timeZone: 'UTC',
+    const date = fromTimelinePlainDateTime(asset.localDateTime).toLocaleString({
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
     });
     const hasPlace = asset.city && asset.country;
 

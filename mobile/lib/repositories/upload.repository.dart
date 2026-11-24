@@ -1,14 +1,15 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:background_downloader/background_downloader.dart';
+import 'package:background_downloader/background_downloader.dart' hide Request;
 import 'package:cancellation_token_http/http.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/constants/constants.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
-import 'package:logging/logging.dart';
+import 'package:immich_mobile/repositories/native_tus_upload.repository.dart';
 import 'package:immich_mobile/utils/debug_print.dart';
+import 'package:logging/logging.dart';
 
 class UploadTaskWithFile {
   final File file;
@@ -17,13 +18,17 @@ class UploadTaskWithFile {
   const UploadTaskWithFile({required this.file, required this.task});
 }
 
-final uploadRepositoryProvider = Provider((ref) => UploadRepository());
+final uploadRepositoryProvider = Provider((ref) {
+  final nativeTusRepository = ref.watch(nativeTusUploadRepositoryProvider);
+  return UploadRepository(nativeTusRepository);
+});
 
 class UploadRepository {
+  final NativeTusUploadRepository nativeTusRepository;
   void Function(TaskStatusUpdate)? onUploadStatus;
   void Function(TaskProgressUpdate)? onTaskProgress;
 
-  UploadRepository() {
+  UploadRepository(this.nativeTusRepository) {
     FileDownloader().registerCallbacks(
       group: kBackupGroup,
       taskStatusCallback: (update) => onUploadStatus?.call(update),
@@ -95,49 +100,148 @@ class UploadRepository {
   Future<void> backupWithDartClient(Iterable<UploadTaskWithFile> tasks, CancellationToken cancelToken) async {
     final httpClient = Client();
     final String savedEndpoint = Store.get(StoreKey.serverEndpoint);
+    final String deviceId = Store.get(StoreKey.deviceId);
+    final logger = Logger('UploadRepository');
+    bool? supportsResumableUpload;
 
-    Logger logger = Logger('UploadRepository');
-    for (final candidate in tasks) {
-      if (cancelToken.isCancelled) {
-        logger.warning("Backup was cancelled by the user");
-        break;
-      }
+    try {
+      for (final candidate in tasks) {
+        if (cancelToken.isCancelled) {
+          logger.warning("Backup was cancelled by the user");
+          break;
+        }
 
-      try {
-        final fileStream = candidate.file.openRead();
-        final assetRawUploadData = MultipartFile(
-          "assetData",
-          fileStream,
-          candidate.file.lengthSync(),
-          filename: candidate.task.filename,
-        );
+        var resumable = false;
+        try {
+          final fileSize = await candidate.file.length();
+          resumable = fileSize >= kNativeTusUploadThreshold;
 
-        final baseRequest = MultipartRequest('POST', Uri.parse('$savedEndpoint/assets'));
+          if (resumable) {
+            supportsResumableUpload ??= await _supportsResumableUpload(
+              httpClient,
+              Uri.parse('$savedEndpoint/upload'),
+              candidate.task.headers,
+              cancelToken,
+            );
+            if (!supportsResumableUpload) {
+              await enqueueBackground(candidate.task);
+              continue;
+            }
 
-        baseRequest.headers.addAll(candidate.task.headers);
-        baseRequest.fields.addAll(candidate.task.fields);
-        baseRequest.files.add(assetRawUploadData);
+            final metadata = NativeTusUploadMetadata(
+              filename: candidate.task.fields['filename'] ?? candidate.task.filename,
+              deviceAssetId: candidate.task.fields['deviceAssetId'] ?? '',
+              deviceId: deviceId,
+              fileCreatedAt: candidate.task.fields['fileCreatedAt'] ?? DateTime.now().toUtc().toIso8601String(),
+              fileModifiedAt: candidate.task.fields['fileModifiedAt'] ?? DateTime.now().toUtc().toIso8601String(),
+              isFavorite: candidate.task.fields['isFavorite'] == 'true',
+              duration: candidate.task.fields['duration'],
+              livePhotoVideoId: candidate.task.fields['livePhotoVideoId'],
+            );
 
-        final response = await httpClient.send(baseRequest, cancellationToken: cancelToken);
+            // Emit running status when upload starts
+            onUploadStatus?.call(TaskStatusUpdate(candidate.task, TaskStatus.running));
 
-        final responseBody = jsonDecode(await response.stream.bytesToString());
+            final result = await nativeTusRepository.uploadFile(
+              candidate.file,
+              metadata,
+              cancellationToken: cancelToken,
+              requiresWiFi: candidate.task.requiresWiFi,
+              onProgress: (bytesUploaded, totalBytes) {
+                if (totalBytes <= 0) return;
+                onTaskProgress?.call(TaskProgressUpdate(candidate.task, bytesUploaded / totalBytes, totalBytes));
+              },
+            );
 
-        if (![200, 201].contains(response.statusCode)) {
-          final error = responseBody;
+            if (result.isCancelled) {
+              onUploadStatus?.call(TaskStatusUpdate(candidate.task, TaskStatus.canceled));
+            } else if (result.isSuccess) {
+              // Emit a TaskStatusUpdate to trigger the backup state update
+              final responseBody = jsonEncode({
+                'id': result.assetId,
+                'status': result.isDuplicate ? 'duplicate' : 'created',
+              });
+              final update = TaskStatusUpdate(
+                candidate.task,
+                TaskStatus.complete,
+                null, // exception
+                responseBody,
+                null, // responseHeaders
+                result.isDuplicate ? 200 : 201, // responseStatusCode
+              );
+              onUploadStatus?.call(update);
+              logger.fine('Native tus upload completed for ${candidate.task.filename}: assetId=${result.assetId}');
+            } else {
+              logger.warning('Native tus upload failed for ${candidate.task.filename}: ${result.error}');
+              // Emit a failed status update
+              final update = TaskStatusUpdate(
+                candidate.task,
+                TaskStatus.failed,
+                TaskException(result.error ?? 'Unknown error'),
+              );
+              onUploadStatus?.call(update);
+            }
+            continue;
+          }
 
-          logger.warning(
-            "Error(${error['statusCode']}) uploading ${candidate.task.filename} | Created on ${candidate.task.fields["fileCreatedAt"]} | ${error['error']}",
+          final fileStream = candidate.file.openRead();
+          final assetRawUploadData = MultipartFile(
+            "assetData",
+            fileStream,
+            fileSize,
+            filename: candidate.task.filename,
           );
 
-          continue;
+          final baseRequest = MultipartRequest('POST', Uri.parse('$savedEndpoint/assets'));
+
+          baseRequest.headers.addAll(candidate.task.headers);
+          baseRequest.fields.addAll(candidate.task.fields);
+          baseRequest.files.add(assetRawUploadData);
+
+          final response = await httpClient.send(baseRequest, cancellationToken: cancelToken);
+
+          final responseBody = jsonDecode(await response.stream.bytesToString());
+
+          if (![200, 201].contains(response.statusCode)) {
+            final error = responseBody;
+
+            logger.warning(
+              "Error(${error['statusCode']}) uploading ${candidate.task.filename} | Created on ${candidate.task.fields["fileCreatedAt"]} | ${error['error']}",
+            );
+
+            continue;
+          }
+        } on CancelledException {
+          logger.warning("Backup was cancelled by the user");
+          break;
+        } catch (error, stackTrace) {
+          logger.warning('Error uploading ${candidate.task.filename}', error, stackTrace);
+          if (resumable) {
+            onUploadStatus?.call(TaskStatusUpdate(candidate.task, TaskStatus.failed, TaskException(error.toString())));
+          }
         }
-      } on CancelledException {
-        logger.warning("Backup was cancelled by the user");
-        break;
-      } catch (error, stackTrace) {
-        logger.warning("Error backup asset: ${error.toString()}: $stackTrace");
-        continue;
       }
+    } finally {
+      httpClient.close();
     }
+  }
+
+  Future<bool> _supportsResumableUpload(
+    Client client,
+    Uri endpoint,
+    Map<String, String> headers,
+    CancellationToken cancellationToken,
+  ) async {
+    final request = Request('OPTIONS', endpoint)..followRedirects = false;
+    request.headers.addAll(headers);
+    final response = await client.send(request, cancellationToken: cancellationToken);
+    await response.stream.drain<void>();
+    if (response.statusCode == 404 || response.statusCode == 405) return false;
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ClientException('Upload capability request failed with status ${response.statusCode}', endpoint);
+    }
+
+    return response.headers['tus-version']?.split(',').any((version) => version.trim() == '1.0.0') ?? false;
   }
 }
