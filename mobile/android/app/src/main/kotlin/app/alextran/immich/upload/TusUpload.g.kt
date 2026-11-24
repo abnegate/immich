@@ -66,7 +66,7 @@ private object TusUploadPigeonUtils {
     }
     return a == b
   }
-      
+
 }
 
 /**
@@ -422,7 +422,7 @@ class TusUploadCallbackApi(private val binaryMessenger: BinaryMessenger, private
         }
       } else {
         callback(Result.failure(TusUploadPigeonUtils.createConnectionError(channelName)))
-      } 
+      }
     }
   }
   /** Called when upload status changes */
@@ -440,7 +440,7 @@ class TusUploadCallbackApi(private val binaryMessenger: BinaryMessenger, private
         }
       } else {
         callback(Result.failure(TusUploadPigeonUtils.createConnectionError(channelName)))
-      } 
+      }
     }
   }
 }

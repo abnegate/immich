@@ -116,7 +116,7 @@ func deepHashTusUpload(value: Any?, hasher: inout Hasher) {
   }
 
   if let valueDict = value as? [AnyHashable: AnyHashable] {
-    for key in valueDict.keys { 
+    for key in valueDict.keys {
       hasher.combine(key)
       deepHashTusUpload(value: valueDict[key]!, hasher: &hasher)
     }
@@ -130,7 +130,7 @@ func deepHashTusUpload(value: Any?, hasher: inout Hasher) {
   return hasher.combine(String(describing: value))
 }
 
-    
+
 
 /// Metadata for tus upload
 ///
