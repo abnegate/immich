@@ -745,10 +745,14 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     await this.userRepository.updateUsage(userId, fileSize);
 
     await this.storageRepository.utimes(filePath, new Date(), fileModifiedAt);
-    await this.assetRepository.upsertExif(
-      { assetId: asset.id, fileSizeInByte: fileSize },
-      { lockedPropertiesBehavior: 'override' },
-    );
+    try {
+      await this.assetRepository.upsertExif(
+        { assetId: asset.id, fileSizeInByte: fileSize },
+        { lockedPropertiesBehavior: 'override' },
+      );
+    } catch (error) {
+      this.logger.warn(`Failed to prefill EXIF for asset ${asset.id}: ${error}`);
+    }
 
     if (hasStagedSidecar) {
       if (!(await this.attachStagedSidecar(asset.id, filePath))) {

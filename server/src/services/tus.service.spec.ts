@@ -785,6 +785,24 @@ describe(TusService.name, () => {
       );
     });
 
+    it('should finalize and queue extraction when preliminary EXIF storage fails', async () => {
+      const upload = { ...mockUpload, offset: mockUpload.size };
+      const asset = { ...assetStub.image, ownerId: userId };
+      mocks.asset.create.mockResolvedValue(asset);
+      mocks.asset.upsertExif.mockRejectedValue(new Error('EXIF write failed'));
+      mocks.storage.readTextFile.mockResolvedValue(JSON.stringify(upload));
+
+      const server = await (sut as any).initializeTusServer();
+      const result = await server.options.onUploadFinish({ ...createMockRequest(userId), method: 'PATCH' }, upload);
+
+      expect(result.headers).toEqual({ 'X-Immich-Asset-Id': asset.id, 'X-Immich-Duplicate': 'false' });
+      expect(mocks.event.emit).toHaveBeenCalledWith('AssetCreate', { asset });
+      expect(mocks.job.queue).toHaveBeenCalledWith({
+        name: JobName.AssetExtractMetadata,
+        data: { id: asset.id, source: 'upload' },
+      });
+    });
+
     it('should throw BadRequestException if filename is missing', async () => {
       const upload = {
         ...mockUpload,
