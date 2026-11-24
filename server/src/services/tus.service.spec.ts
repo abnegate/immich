@@ -1,8 +1,14 @@
 import { BadRequestException } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { Stats } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { lock } from 'proper-lockfile';
 import { AssetFileType, AssetType, AssetVisibility, JobName } from 'src/enum';
 import { TusService } from 'src/services/tus.service';
+import { ASSET_CHECKSUM_CONSTRAINT } from 'src/utils/database';
+import { assetStub } from 'test/fixtures/asset.stub';
 import { authStub } from 'test/fixtures/auth.stub';
 import { newTestService, ServiceMocks } from 'test/utils';
 import { vi } from 'vitest';
@@ -19,7 +25,11 @@ vi.mock('@tus/server', () => ({
 }));
 
 vi.mock('@tus/file-store', () => ({
-  FileStore: vi.fn().mockImplementation(() => ({})),
+  FileStore: vi.fn().mockImplementation(() => ({ extensions: ['creation', 'creation-defer-length'] })),
+}));
+
+vi.mock('proper-lockfile', () => ({
+  lock: vi.fn().mockImplementation(() => Promise.resolve(() => Promise.resolve())),
 }));
 
 // TUS library decodes base64 metadata before passing to callbacks, so use plain text
@@ -82,6 +92,7 @@ describe(TusService.name, () => {
     ({ sut, mocks } = newTestService(TusService));
     // Mock storage mkdirSync to avoid filesystem operations
     mocks.storage.mkdirSync.mockImplementation(() => {});
+    mocks.storage.unlink.mockImplementation(() => Promise.resolve());
   });
 
   describe('parseMetadata', () => {
@@ -390,12 +401,51 @@ describe(TusService.name, () => {
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue('existing-asset-id');
+      mocks.asset.getById.mockResolvedValue({
+        ...assetStub.image,
+        ownerId: userId,
+        originalPath: '/data/upload/existing.jpg',
+      });
 
       const result = await (sut as any).createAssetFromUpload(userId, upload);
 
       expect(result).toEqual({ assetId: 'existing-asset-id', isDuplicate: true });
       expect(mocks.asset.create).not.toHaveBeenCalled();
       expect(mocks.job.queue).not.toHaveBeenCalled();
+    });
+
+    it('should retain the registered original when another worker finalized the same upload', async () => {
+      const upload = { ...mockUpload, offset: mockUpload.size };
+      const originalPath = '/data/upload/upload-id.jpg';
+      const asset = { ...assetStub.image, id: 'winning-asset-id', ownerId: userId, originalPath };
+      mocks.storage.readTextFile.mockResolvedValue(JSON.stringify(upload));
+      mocks.asset.getUploadAssetIdByChecksum.mockImplementation(() =>
+        Promise.resolve(mocks.asset.create.mock.calls.length > 0 ? asset.id : undefined),
+      );
+      mocks.asset.create.mockRejectedValue(
+        Object.assign(new Error('conflict'), {
+          constraint_name: ASSET_CHECKSUM_CONSTRAINT,
+        }),
+      );
+      mocks.asset.getById.mockResolvedValue(asset);
+
+      const server = await (sut as any).initializeTusServer();
+      const result = await server.options.onUploadFinish({ ...createMockRequest(userId), method: 'PATCH' }, upload);
+
+      expect(result.headers).toEqual({ 'X-Immich-Asset-Id': asset.id, 'X-Immich-Duplicate': 'false' });
+      expect(mocks.storage.unlink).not.toHaveBeenCalled();
+    });
+
+    it('should retain upload bytes when the existing asset cannot be verified', async () => {
+      const upload = { ...mockUpload, offset: mockUpload.size };
+      mocks.storage.readTextFile.mockResolvedValue(JSON.stringify(upload));
+      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue('missing-asset-id');
+
+      const server = await (sut as any).initializeTusServer();
+      const request = { ...createMockRequest(userId), method: 'PATCH' };
+
+      await expect(server.options.onUploadFinish(request, upload)).rejects.toMatchObject({ status_code: 500 });
+      expect(mocks.storage.unlink).not.toHaveBeenCalled();
     });
 
     it('should handle sidecar data', async () => {
@@ -717,6 +767,11 @@ describe(TusService.name, () => {
       const upload = mockUpload;
 
       mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue('existing-asset-id');
+      mocks.asset.getById.mockResolvedValue({
+        ...assetStub.image,
+        ownerId: userId,
+        originalPath: '/data/upload/existing.jpg',
+      });
 
       await (sut as any).createAssetFromUpload(userId, upload);
 
@@ -814,6 +869,58 @@ describe(TusService.name, () => {
       await sut.handleUploadCleanup();
 
       expect(mocks.storage.unlink.mock.calls).toEqual([[path], [`${path}.json`]]);
+    });
+
+    it('should leave a transfer alone while another worker holds its upload lock', async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'immich-tus-'));
+      const path = join(directory, 'upload');
+      const { lock: lockFile } = await vi.importActual<typeof import('proper-lockfile')>('proper-lockfile');
+      vi.mocked(lock).mockImplementationOnce(lockFile).mockImplementationOnce(lockFile);
+
+      const cleanup = newTestService(TusService);
+      const [owner, first, second, filename] = uploadId.split('/');
+      cleanup.mocks.storage.readdir
+        .mockResolvedValueOnce([owner])
+        .mockResolvedValueOnce([first])
+        .mockResolvedValueOnce([second])
+        .mockResolvedValueOnce([`${filename}.json`]);
+      cleanup.mocks.storage.readTextFile.mockResolvedValue(
+        JSON.stringify({ ...upload, creation_date: '2023-01-01T00:00:00.000Z' }),
+      );
+      cleanup.mocks.storage.stat.mockResolvedValue({ size: 100 } as Stats);
+
+      vi.spyOn(sut as any, 'getUploadPath').mockReturnValue(path);
+      vi.spyOn(cleanup.sut as any, 'getUploadPath').mockReturnValue(path);
+
+      let started!: () => void;
+      const writing = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let finish!: () => void;
+      const written = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const server = await (sut as any).initializeTusServer();
+      server.handle.mockImplementation(() => {
+        started();
+        return written;
+      });
+      const request = {
+        method: 'PATCH',
+        url: `/api/upload/${uploadId}`,
+        headers: { 'tus-resumable': '1.0.0' },
+      } as unknown as Request;
+
+      const transfer = sut.handleTusUpload(auth, request, {} as Response);
+      try {
+        await Promise.race([writing, transfer]);
+        await cleanup.sut.handleUploadCleanup();
+        expect(cleanup.mocks.storage.unlink).not.toHaveBeenCalled();
+      } finally {
+        finish();
+        await transfer;
+        await rm(directory, { recursive: true });
+      }
     });
 
     it('should configure tus to protect the bytes of completed uploads from termination', async () => {

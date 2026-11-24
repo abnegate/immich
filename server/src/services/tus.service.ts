@@ -1,10 +1,12 @@
 import { BadRequestException, Injectable, OnApplicationShutdown } from '@nestjs/common';
-import AsyncLock from 'async-lock';
 import { Request, Response } from 'express';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
+import { setTimeout } from 'node:timers/promises';
+import { lock } from 'proper-lockfile';
 import { StorageCore } from 'src/cores/storage.core';
 import { OnJob } from 'src/decorators';
 import { AuthDto } from 'src/dtos/auth.dto';
@@ -16,6 +18,8 @@ import { mimeTypes } from 'src/utils/mime-types';
 const TUS_EXPIRATION_MS = 24 * 60 * 60 * 1000;
 const TUS_PATH = '/api/upload';
 const TUS_VERSION = '1.0.0';
+const LOCK_STALE_MS = 60_000;
+const LOCK_RETRY_MS = 30_000;
 const ASSET_ID_HEADER = 'X-Immich-Asset-Id';
 const DUPLICATE_HEADER = 'X-Immich-Duplicate';
 const UUID = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';
@@ -56,6 +60,8 @@ interface UploadRecord extends Upload {
   readonly result?: UploadResult;
 }
 
+type Release = () => Promise<void>;
+
 type TusServer = {
   handle: (request: Request, response: Response) => Promise<void>;
 };
@@ -67,7 +73,7 @@ const getHeader = (headers: Headers, name: string): string | undefined => {
 
 @Injectable()
 export class TusService extends BaseService implements OnApplicationShutdown {
-  private readonly uploads = new AsyncLock({ maxPending: Number.POSITIVE_INFINITY });
+  private readonly creation = new AsyncLocalStorage<{ release?: Release }>();
   private tusServer: TusServer | null = null;
   private initPromise: Promise<void> | null = null;
 
@@ -91,12 +97,15 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     const uploadPath = StorageCore.getBaseFolder(StorageFolder.Upload);
     this.storageRepository.mkdirSync(uploadPath);
 
+    const datastore = new FileStore({
+      directory: uploadPath,
+      expirationPeriodInMilliseconds: TUS_EXPIRATION_MS,
+    });
+    datastore.extensions = datastore.extensions.filter((extension) => extension !== 'creation-defer-length');
+
     this.tusServer = new Server({
       path: TUS_PATH,
-      datastore: new FileStore({
-        directory: uploadPath,
-        expirationPeriodInMilliseconds: TUS_EXPIRATION_MS,
-      }),
+      datastore,
       relativeLocation: true,
       disableTerminationForFinishedUploads: true,
       allowedHeaders: ['Authorization', 'x-api-key', 'x-immich-user-token'],
@@ -131,11 +140,11 @@ export class TusService extends BaseService implements OnApplicationShutdown {
         }
         return Promise.resolve();
       },
-      onUploadCreate: (req, upload) => {
+      onUploadCreate: async (req, upload) => {
         const userId = getHeader(req.headers, 'x-immich-user-id');
         if (!userId) {
           this.logger.warn('TUS upload rejected: missing x-immich-user-id header');
-          return Promise.reject(this.toTusError(401, 'Unauthorized'));
+          throw this.toTusError(401, 'Unauthorized');
         }
 
         // Validate required metadata
@@ -143,34 +152,40 @@ export class TusService extends BaseService implements OnApplicationShutdown {
 
         if (!metadata.filename) {
           this.logger.warn('TUS upload rejected: missing filename metadata');
-          return Promise.reject(this.toTusError(400, 'Missing required metadata: filename'));
+          throw this.toTusError(400, 'Missing required metadata: filename');
         }
         if (!metadata.deviceAssetId) {
           this.logger.warn('TUS upload rejected: missing deviceAssetId metadata');
-          return Promise.reject(this.toTusError(400, 'Missing required metadata: deviceAssetId'));
+          throw this.toTusError(400, 'Missing required metadata: deviceAssetId');
         }
         if (!metadata.deviceId) {
           this.logger.warn('TUS upload rejected: missing deviceId metadata');
-          return Promise.reject(this.toTusError(400, 'Missing required metadata: deviceId'));
+          throw this.toTusError(400, 'Missing required metadata: deviceId');
         }
 
         // Validate file type
         const filename = metadata.filename.toLowerCase();
         if (!mimeTypes.isAsset(filename)) {
           this.logger.warn(`TUS upload rejected: unsupported file type ${filename}`);
-          return Promise.reject(this.toTusError(400, `Unsupported file type: ${filename}`));
+          throw this.toTusError(400, `Unsupported file type: ${filename}`);
         }
 
         // Check quota
         const quotaSize = getHeader(req.headers, 'x-immich-quota-size');
         const quotaUsage = getHeader(req.headers, 'x-immich-quota-usage');
-        const uploadSize = upload.size || 0;
-        if (quotaSize && Number(quotaSize) < Number(quotaUsage) + uploadSize) {
+        if (upload.size === undefined) {
+          throw this.toTusError(400, 'Upload-Length is required');
+        }
+        if (quotaSize && Number(quotaSize) < Number(quotaUsage) + upload.size) {
           this.logger.warn('TUS upload rejected: quota exceeded');
-          return Promise.reject(this.toTusError(400, 'Quota has been exceeded!'));
+          throw this.toTusError(400, 'Quota has been exceeded!');
         }
 
-        return Promise.resolve({});
+        const creation = this.creation.getStore();
+        if (creation) {
+          creation.release = await this.lockUpload(upload.id, false);
+        }
+        return {};
       },
       onUploadFinish: async (req, upload) => {
         const userId = getHeader(req.headers, 'x-immich-user-id');
@@ -183,7 +198,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
           // The creation-with-upload handler still reads the file after its finish hook.
           if (result.isDuplicate && req.method === 'PATCH') {
             const path = this.getUploadPath(upload.id);
-            await this.storageRepository.unlink(path).catch((error: unknown) => {
+            await this.removeDuplicate(userId, result.assetId, path).catch((error: unknown) => {
               this.logger.warn(`Could not remove duplicate upload ${upload.id}: ${error}`);
             });
           }
@@ -207,12 +222,40 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     request.headers['x-immich-quota-usage'] = String(auth.user.quotaUsageInBytes ?? 0);
 
     const server = await this.initializeTusServer();
+    if (request.method === 'POST') {
+      const creation: { release?: Release } = {};
+      return this.creation.run(creation, async () => {
+        try {
+          await server.handle(request, response);
+        } finally {
+          await creation.release?.();
+        }
+      });
+    }
+
     const id = this.getUploadId(request.url);
-    if (!id || UPLOAD_ID.exec(id)?.[1] !== auth.user.id) {
+    if (!id || UPLOAD_ID.exec(id)?.[1] !== auth.user.id || !['HEAD', 'PATCH', 'DELETE'].includes(request.method)) {
       return server.handle(request, response);
     }
 
-    await this.uploads.acquire(id, async () => {
+    let release: Release;
+    try {
+      release = await this.lockUpload(id, true);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        return server.handle(request, response);
+      }
+      if (code === 'ELOCKED') {
+        response.statusCode = 409;
+        response.setHeader('Tus-Resumable', TUS_VERSION);
+        response.end();
+        return;
+      }
+      throw error;
+    }
+
+    try {
       if (request.method === 'HEAD' && request.headers['tus-resumable'] === TUS_VERSION) {
         const upload = await this.readUpload(id);
         if (upload && !this.isExpired(upload) && upload.size !== undefined) {
@@ -228,8 +271,10 @@ export class TusService extends BaseService implements OnApplicationShutdown {
         }
       }
 
-      return server.handle(request, response);
-    });
+      await server.handle(request, response);
+    } finally {
+      await release();
+    }
   }
 
   onApplicationShutdown(): void {
@@ -243,8 +288,19 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     const directory = StorageCore.getBaseFolder(StorageFolder.Upload);
     let deletedCount = 0;
     for await (const id of this.findUploads(directory, [])) {
-      const deleted = await this.uploads.acquire(id, () => this.removeExpiredUpload(id));
-      deletedCount += Number(deleted);
+      const release = await this.lockUpload(id, false).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT' && error.code !== 'ELOCKED') {
+          throw error;
+        }
+      });
+      if (!release) {
+        continue;
+      }
+      try {
+        deletedCount += Number(await this.removeExpiredUpload(id));
+      } finally {
+        await release();
+      }
     }
     if (deletedCount > 0) {
       this.logger.log(`Cleaned up ${deletedCount} expired TUS uploads`);
@@ -260,6 +316,24 @@ export class TusService extends BaseService implements OnApplicationShutdown {
 
   private getUploadPath(id: string): string {
     return join(StorageCore.getBaseFolder(StorageFolder.Upload), id);
+  }
+
+  private async lockUpload(id: string, wait: boolean): Promise<Release> {
+    // The API and the daily cleanup job run in different workers and share the upload volume.
+    const path = this.getUploadPath(id);
+    const deadline = performance.now() + LOCK_RETRY_MS;
+    let delay = 50;
+    while (true) {
+      try {
+        return await lock(path, { realpath: false, stale: LOCK_STALE_MS });
+      } catch (error) {
+        if (!wait || (error as NodeJS.ErrnoException).code !== 'ELOCKED' || performance.now() >= deadline) {
+          throw error;
+        }
+      }
+      await setTimeout(delay);
+      delay = Math.min(delay * 2, 1000);
+    }
   }
 
   private getResultHeaders(result: UploadResult): Record<string, string> {
@@ -372,9 +446,14 @@ export class TusService extends BaseService implements OnApplicationShutdown {
 
     const path = this.getUploadPath(id);
     const size = await this.getFileSize(path);
-    // Legacy completed uploads point directly to these bytes. Their metadata may have no result.
-    if (size !== undefined && (upload.result?.isDuplicate || (!upload.result && size < (upload.size ?? Infinity)))) {
-      await this.storageRepository.unlink(path);
+    if (size !== undefined) {
+      if (upload.result?.isDuplicate) {
+        const owner = UPLOAD_ID.exec(id)![1];
+        await this.removeDuplicate(owner, upload.result.assetId, path);
+      } else if (!upload.result && size < (upload.size ?? Number.POSITIVE_INFINITY)) {
+        // Legacy completed uploads point directly to these bytes and may have no result.
+        await this.storageRepository.unlink(path);
+      }
     }
     const temporary = `${path}.json.tmp`;
     if (await this.storageRepository.checkFileExists(temporary)) {
@@ -412,6 +491,26 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     };
   }
 
+  private async getRegisteredOriginal(userId: string, assetId: string): Promise<string | undefined> {
+    const asset = await this.assetRepository.getById(assetId);
+    return asset?.ownerId === userId ? asset.originalPath : undefined;
+  }
+
+  private async getExistingUploadResult(userId: string, assetId: string, path: string): Promise<UploadResult> {
+    const original = await this.getRegisteredOriginal(userId, assetId);
+    if (!original) {
+      throw new Error('Could not verify the registered asset original');
+    }
+    return { assetId, isDuplicate: original !== path };
+  }
+
+  private async removeDuplicate(userId: string, assetId: string, path: string): Promise<void> {
+    const original = await this.getRegisteredOriginal(userId, assetId);
+    if (original && original !== path) {
+      await this.storageRepository.unlink(path);
+    }
+  }
+
   private async createAssetFromUpload(userId: string, upload: Upload): Promise<UploadResult> {
     const metadata = this.parseMetadata(upload.metadata);
 
@@ -428,8 +527,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     // Check for duplicate
     const existingAssetId = await this.assetRepository.getUploadAssetIdByChecksum(userId, checksum);
     if (existingAssetId) {
-      const existingAsset = await this.assetRepository.getById(existingAssetId);
-      return { assetId: existingAssetId, isDuplicate: existingAsset?.originalPath !== filePath };
+      return this.getExistingUploadResult(userId, existingAssetId, filePath);
     }
 
     const parseDate = (dateString: string | undefined): Date => {
@@ -489,7 +587,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       if (!assetId) {
         throw new Error('Could not find the asset for the duplicate checksum');
       }
-      return { assetId, isDuplicate: true };
+      return this.getExistingUploadResult(userId, assetId, filePath);
     }
 
     // Handle sidecar if provided as base64 in metadata

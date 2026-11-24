@@ -995,6 +995,7 @@ describe('/upload (TUS protocol)', () => {
 
       expect(response.status).toBe(204);
       expect(response.headers['tus-version']).toBe('1.0.0');
+      expect(response.headers['tus-extension']).not.toContain('creation-defer-length');
       expect(response.headers['access-control-allow-origin']).toBe(origin);
       expect(response.headers['access-control-allow-methods']).toContain('POST');
       expect(response.headers['access-control-allow-headers'].toLowerCase()).toContain('authorization');
@@ -1002,6 +1003,25 @@ describe('/upload (TUS protocol)', () => {
   });
 
   describe('Negative test cases', () => {
+    it('should reject creation when the upload length is deferred', async () => {
+      const response = await request(app)
+        .post('/upload')
+        .set('Authorization', `Bearer ${quotaUser.accessToken}`)
+        .set('Tus-Resumable', '1.0.0')
+        .set('Upload-Defer-Length', '1')
+        .set(
+          'Upload-Metadata',
+          encodeMetadata({
+            filename: 'deferred.png',
+            deviceAssetId: 'deferred',
+            deviceId: 'test-device',
+          }),
+        );
+
+      expect(response.status).toBe(501);
+      expect(response.headers['location']).toBeUndefined();
+    });
+
     it('should reject PATCH with incorrect offset', async () => {
       const imageData = makeRandomImage();
       const createResponse = await createTusUpload(user.accessToken, {
