@@ -426,6 +426,17 @@ export class AssetRepository {
       .executeTakeFirst();
   }
 
+  async hasOriginal(ownerId: string, path: string): Promise<boolean> {
+    const asset = await this.db
+      .selectFrom('asset')
+      .select('id')
+      .where('originalPath', '=', path)
+      .where('ownerId', '=', asUuid(ownerId))
+      .limit(1)
+      .executeTakeFirst();
+    return asset !== undefined;
+  }
+
   /**
    * Get assets by device's Id on the database
    * @param ownerId

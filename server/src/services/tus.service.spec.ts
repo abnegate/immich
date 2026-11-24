@@ -4,6 +4,7 @@ import { Stats } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable, Writable } from 'node:stream';
 import { lock } from 'proper-lockfile';
 import { AssetFileType, AssetType, AssetVisibility, JobName } from 'src/enum';
 import { TusService } from 'src/services/tus.service';
@@ -917,7 +918,7 @@ describe(TusService.name, () => {
       expect(response.end).toHaveBeenCalled();
     });
 
-    it('should keep completed asset bytes even if tus stored a stale offset', async () => {
+    it('should keep a registered original without a persisted tus result', async () => {
       const path = `/data/upload/${uploadId}`;
       const [owner, first, second, filename] = uploadId.split('/');
       mocks.storage.readdir
@@ -930,9 +931,50 @@ describe(TusService.name, () => {
       );
       mocks.storage.stat.mockResolvedValue({ size: upload.size } as Stats);
 
+      mocks.asset.hasOriginal.mockResolvedValue(true);
+
       await sut.handleUploadCleanup();
 
+      expect(mocks.asset.hasOriginal).toHaveBeenCalledExactlyOnceWith(auth.user.id, path);
+
       expect(mocks.storage.unlink).toHaveBeenCalledExactlyOnceWith(`${path}.json`);
+    });
+
+    it('should reclaim a fully staged expired upload when finalization never registered an asset', async () => {
+      const path = `/data/upload/${uploadId}`;
+      const [owner, first, second, filename] = uploadId.split('/');
+      mocks.storage.readdir
+        .mockResolvedValueOnce([owner])
+        .mockResolvedValueOnce([first])
+        .mockResolvedValueOnce([second])
+        .mockResolvedValueOnce([`${filename}.json`]);
+      mocks.storage.readTextFile.mockResolvedValue(
+        JSON.stringify({ ...upload, creation_date: '2023-01-01T00:00:00.000Z' }),
+      );
+      mocks.storage.stat.mockResolvedValue({ size: upload.size } as Stats);
+      mocks.storage.checkFileExists.mockImplementation((file) => Promise.resolve(file === `${path}.sidecar`));
+
+      await sut.handleUploadCleanup();
+
+      expect(mocks.storage.unlink.mock.calls).toEqual([[path], [`${path}.sidecar`], [`${path}.json`]]);
+    });
+
+    it('should keep the upload record when expiration cleanup needs a retry', async () => {
+      const path = `/data/upload/${uploadId}`;
+      const [owner, first, second, filename] = uploadId.split('/');
+      mocks.storage.readdir
+        .mockResolvedValueOnce([owner])
+        .mockResolvedValueOnce([first])
+        .mockResolvedValueOnce([second])
+        .mockResolvedValueOnce([`${filename}.json`]);
+      mocks.storage.readTextFile.mockResolvedValue(
+        JSON.stringify({ ...upload, creation_date: '2023-01-01T00:00:00.000Z' }),
+      );
+      mocks.storage.stat.mockResolvedValue({ size: upload.size } as Stats);
+      mocks.storage.unlink.mockRejectedValueOnce(new Error('Temporary storage failure'));
+
+      await expect(sut.handleUploadCleanup()).rejects.toThrow('Temporary storage failure');
+      expect(mocks.storage.unlink).toHaveBeenCalledExactlyOnceWith(path);
     });
 
     it('should remove an expired nested partial upload and its staged sidecar', async () => {
@@ -1005,6 +1047,48 @@ describe(TusService.name, () => {
         await transfer;
         await rm(directory, { recursive: true });
       }
+    });
+
+    it('should allow staging a sidecar for a fully transferred upload before registration', async () => {
+      const path = `/data/upload/${uploadId}`;
+      const contents = Buffer.from('XMP data');
+      const temporary = `${path}.sidecar.tmp`;
+      const request = Object.assign(Readable.from([contents]), {
+        url: `/api/upload/${uploadId}/sidecar`,
+        headers: { 'content-type': 'application/octet-stream', 'content-length': String(contents.length) },
+      }) as unknown as Request;
+      const written: Buffer[] = [];
+      mocks.storage.readTextFile.mockResolvedValue(JSON.stringify(upload));
+      mocks.storage.stat.mockImplementation((file) =>
+        Promise.resolve({ size: file === temporary ? contents.length : upload.size } as Stats),
+      );
+      mocks.storage.createWriteStream.mockReturnValue(
+        new Writable({
+          write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+            written.push(chunk);
+            callback();
+          },
+        }),
+      );
+
+      await sut.stageSidecar(auth, request);
+
+      expect(written).toEqual([contents]);
+      expect(mocks.storage.rename).toHaveBeenCalledExactlyOnceWith(temporary, `${path}.sidecar`);
+    });
+
+    it('should reject staging a sidecar after a legacy original was registered', async () => {
+      mocks.storage.readTextFile.mockResolvedValue(JSON.stringify(upload));
+      mocks.storage.stat.mockResolvedValue({ size: upload.size } as Stats);
+      mocks.asset.hasOriginal.mockResolvedValue(true);
+      const request = {
+        url: `/api/upload/${uploadId}/sidecar`,
+        headers: { 'content-type': 'application/octet-stream', 'content-length': '0' },
+      } as unknown as Request;
+
+      await expect(sut.stageSidecar(auth, request)).rejects.toThrow(ConflictException);
+      expect(mocks.asset.hasOriginal).toHaveBeenCalledExactlyOnceWith(auth.user.id, `/data/upload/${uploadId}`);
+      expect(mocks.storage.createWriteStream).not.toHaveBeenCalled();
     });
 
     it('should configure tus to protect the bytes of completed uploads from termination', async () => {

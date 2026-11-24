@@ -273,7 +273,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       if (!upload || this.isExpired(upload)) {
         throw new NotFoundException('Upload not found');
       }
-      if (upload.result || (await this.getFileSize(path)) === upload.size) {
+      if (upload.result || (await this.assetRepository.hasOriginal(owner, path))) {
         throw new ConflictException('Upload is already complete');
       }
 
@@ -541,16 +541,11 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       return false;
     }
 
+    const owner = UPLOAD_ID.exec(id)![1];
     const path = this.getUploadPath(id);
     const size = await this.getFileSize(path);
-    if (size !== undefined) {
-      if (upload.result?.isDuplicate) {
-        const owner = UPLOAD_ID.exec(id)![1];
-        await this.removeDuplicate(owner, upload.result.assetId, path);
-      } else if (!upload.result && size < (upload.size ?? Number.POSITIVE_INFINITY)) {
-        // Legacy completed uploads point directly to these bytes and may have no result.
-        await this.storageRepository.unlink(path);
-      }
+    if (size !== undefined && !(await this.assetRepository.hasOriginal(owner, path))) {
+      await this.storageRepository.unlink(path);
     }
     await this.removeStagedSidecar(path);
     const temporary = `${path}.json.tmp`;
