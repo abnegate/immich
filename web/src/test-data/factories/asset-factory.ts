@@ -73,7 +73,10 @@ export const toResponseDto = (...timelineAsset: TimelineAsset[]) => {
     thumbhash: [],
   };
   for (const asset of timelineAsset) {
-    const fileCreatedAt = fromTimelinePlainDateTime(asset.fileCreatedAt).setZone('utc', { keepLocalTime: true }).toISO();
+    const fileCreatedAt = fromTimelinePlainDateTime(asset.fileCreatedAt)
+      .setZone('utc', { keepLocalTime: true })
+      .toJSDate()
+      .toISOString();
     bucketAssets.city.push(asset.city);
     bucketAssets.country.push(asset.country);
     bucketAssets.duration.push(asset.duration!);
