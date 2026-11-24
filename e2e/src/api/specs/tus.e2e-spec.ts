@@ -5,7 +5,7 @@
  * for resumable file uploads in Immich. It tests all aspects of the protocol including
  * upload creation, chunked uploading, status checking, cancellation, and metadata handling.
  */
-import { LoginResponseDto, Permission } from '@immich/sdk';
+import { AssetTypeEnum, LoginResponseDto, Permission } from '@immich/sdk';
 import { readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { createUserDto, uuidDto } from 'src/fixtures';
@@ -380,12 +380,9 @@ describe('/upload (TUS protocol)', () => {
       const assetId = patchResponse.headers['x-immich-asset-id'];
       expect(assetId).toBeDefined();
 
-      await utils.waitForQueueFinish(admin.accessToken, 'metadataExtraction');
-
-      const asset = await utils.getAssetInfo(user.accessToken, assetId);
-      expect(asset.exifInfo).toBeDefined();
-      expect(asset.exifInfo?.exifImageWidth).toBe(800);
-      expect(asset.exifInfo?.exifImageHeight).toBe(800);
+      await expect
+        .poll(() => utils.getAssetInfo(user.accessToken, assetId), { timeout: 10_000 })
+        .toMatchObject({ exifInfo: { exifImageWidth: 800, exifImageHeight: 800 } });
     });
   });
 
@@ -934,16 +931,11 @@ describe('/upload (TUS protocol)', () => {
     });
 
     it('should handle video duration metadata', async () => {
-      const videoFilepath = join(testAssetDir, 'formats/mp4/video.mp4');
-      let videoData: Buffer;
-
-      try {
-        videoData = await readFile(videoFilepath);
-      } catch {
-        // Skip test if video file doesn't exist
-        console.log(`Skipping test: ${videoFilepath} not found`);
-        return;
-      }
+      const motionPhoto = await readFile(join(testAssetDir, 'formats/motionphoto/pixel-8a.jpg'));
+      // The embedded MP4 starts with an ftyp box and its four-byte length.
+      const boxType = motionPhoto.lastIndexOf('ftypisom');
+      expect(boxType).toBeGreaterThan(4);
+      const videoData = motionPhoto.subarray(boxType - 4);
 
       const createResponse = await createTusUpload(user.accessToken, {
         filename: 'video.mp4',
@@ -958,8 +950,14 @@ describe('/upload (TUS protocol)', () => {
       const patchResponse = await uploadChunk(user.accessToken, uploadId, videoData, 0);
       const assetId = patchResponse.headers['x-immich-asset-id'];
 
-      const asset = await utils.getAssetInfo(user.accessToken, assetId);
-      expect(asset.duration).toBeDefined();
+      expect(patchResponse.status).toBe(204);
+      await expect
+        .poll(() => utils.getAssetInfo(user.accessToken, assetId), { timeout: 10_000 })
+        .toMatchObject({
+          type: AssetTypeEnum.Video,
+          checksum: '7YdY+WF0h+CXHbiXpi0HiCMTTjs=',
+          duration: expect.stringMatching(/^00:00:01\./),
+        });
     });
 
     it('should handle custom file timestamps', async () => {
