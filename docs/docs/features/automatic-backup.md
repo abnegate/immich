@@ -1,6 +1,6 @@
 # Automatic Backup
 
-Immich supports uploading photos and videos from your mobile device to the server automatically. The mobile app uses [resumable uploads](/features/resumable-uploads) to ensure reliable transfers even over unstable network connections.
+Immich can automatically upload photos and videos from your mobile device. Large files can use [resumable uploads](https://tus.io/protocols/resumable-upload) when the server supports them.
 
 ---
 
@@ -29,13 +29,10 @@ If background backup is enabled. The app will periodically check if there are an
 
 #### Resumable Uploads
 
-Both foreground and background backups use [resumable uploads](/features/resumable-uploads), which means:
+When the server supports [tus](https://tus.io/protocols/resumable-upload), foreground and background backup use it for files of at least 50 MiB.
 
-- Large files are uploaded in chunks (10MB each)
-- If the connection drops, uploads resume from where they left off
-- No need to re-upload files that were partially transferred
-
-This is especially useful for uploading large videos over mobile connections.
+- Android sends chunks of up to 10 MiB and can resume a previously started upload.
+- iOS sends chunks of up to 50 MiB and can retry an interrupted transfer while the current app process is running.
 
 #### Android
 
