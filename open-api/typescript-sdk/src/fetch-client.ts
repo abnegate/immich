@@ -5646,6 +5646,7 @@ export enum JobName {
     PersonFileMigration = "PersonFileMigration",
     PersonGenerateThumbnail = "PersonGenerateThumbnail",
     SessionCleanup = "SessionCleanup",
+    TusUploadCleanup = "TusUploadCleanup",
     SendMail = "SendMail",
     SidecarQueueAll = "SidecarQueueAll",
     SidecarCheck = "SidecarCheck",
