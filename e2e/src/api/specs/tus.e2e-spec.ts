@@ -891,6 +891,43 @@ describe('/upload (TUS protocol)', () => {
     });
   });
 
+  it('should attach a streamed XMP sidecar and preserve it after upload completion', async () => {
+    const image = makeRandomImage();
+    const description = 'File metadata sent separately from the resumable upload headers';
+    const sidecar = Buffer.from(`<x:xmpmeta xmlns:x="adobe:ns:meta/">
+      <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+        <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <dc:description><rdf:Alt><rdf:li xml:lang="x-default">${description}</rdf:li></rdf:Alt></dc:description>
+        </rdf:Description>
+      </rdf:RDF>
+      <!-- ${' '.repeat(20 * 1024)} -->
+    </x:xmpmeta>`);
+    const creation = await createTusUpload(user.accessToken, {
+      filename: 'with-sidecar.png',
+      size: image.length,
+      metadata: { sidecarRequired: 'true' },
+    });
+    const uploadId = extractUploadId(creation.headers.location);
+    const putSidecar = (accessToken: string) =>
+      request(app)
+        .put(`/upload/${uploadId}/sidecar`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .set('Content-Type', 'application/octet-stream')
+        .set('Content-Length', String(sidecar.length))
+        .send(sidecar);
+
+    await putSidecar(admin.accessToken).expect(403);
+    await putSidecar(user.accessToken).expect(204);
+    await putSidecar(user.accessToken).expect(204);
+
+    const completion = await uploadChunk(user.accessToken, uploadId, image);
+    expect(completion.status).toBe(204);
+    await putSidecar(user.accessToken).expect(409);
+    await expect
+      .poll(() => utils.getAssetInfo(user.accessToken, completion.headers['x-immich-asset-id']), { timeout: 10_000 })
+      .toMatchObject({ exifInfo: { description } });
+  });
+
   describe('Advanced metadata handling', () => {
     it('should handle favorite flag', async () => {
       const imageData = makeRandomImage();

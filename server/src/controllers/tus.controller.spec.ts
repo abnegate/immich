@@ -96,6 +96,14 @@ describe(TusController.name, () => {
     });
   });
 
+  it('should route authenticated sidecar staging to the sidecar service', async () => {
+    const { status } = await request(ctx.getHttpServer()).put('/upload/owner/f1/f2/upload/sidecar');
+    expect(status).toBe(204);
+    expect(ctx.authenticate).toHaveBeenCalled();
+    expect(service.stageSidecar).toHaveBeenCalledTimes(1);
+    expect(service.handleTusUpload).not.toHaveBeenCalled();
+  });
+
   describe('ALL /upload/*', () => {
     // Note: With the wildcard route @All('*'), the upload ID is extracted from the URL
     // by the TUS library's getFileIdFromRequest, not from req.params

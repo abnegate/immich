@@ -1,4 +1,4 @@
-import { All, Controller, Options, Req, Res } from '@nestjs/common';
+import { All, Controller, HttpCode, HttpStatus, Options, Put, Req, Res } from '@nestjs/common';
 import { ApiExcludeController } from '@nestjs/swagger';
 import { Request, Response } from 'express';
 import { Endpoint } from 'src/decorators';
@@ -33,6 +33,13 @@ export class TusController {
   })
   handleTusRequest(@Auth() auth: AuthDto, @Req() req: Request, @Res() res: Response): Promise<void> {
     return this.service.handleTusUpload(auth, req, res);
+  }
+
+  @Put(':owner/:shard/:bucket/:upload/sidecar')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @Authenticated({ permission: Permission.AssetUpload })
+  stageSidecar(@Auth() auth: AuthDto, @Req() request: Request): Promise<void> {
+    return this.service.stageSidecar(auth, request);
   }
 
   @All('*path')

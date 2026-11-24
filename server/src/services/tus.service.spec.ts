@@ -1,4 +1,4 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { Stats } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -10,6 +10,7 @@ import { TusService } from 'src/services/tus.service';
 import { ASSET_CHECKSUM_CONSTRAINT } from 'src/utils/database';
 import { assetStub } from 'test/fixtures/asset.stub';
 import { authStub } from 'test/fixtures/auth.stub';
+import { userStub } from 'test/fixtures/user.stub';
 import { newTestService, ServiceMocks } from 'test/utils';
 import { vi } from 'vitest';
 
@@ -119,6 +120,7 @@ describe(TusService.name, () => {
         visibility: undefined,
         livePhotoVideoId: undefined,
         sidecarData: undefined,
+        sidecarRequired: undefined,
       });
     });
 
@@ -141,6 +143,7 @@ describe(TusService.name, () => {
         visibility: undefined,
         livePhotoVideoId: undefined,
         sidecarData: undefined,
+        sidecarRequired: undefined,
       });
     });
 
@@ -165,6 +168,7 @@ describe(TusService.name, () => {
         visibility: undefined,
         livePhotoVideoId: undefined,
         sidecarData: undefined,
+        sidecarRequired: undefined,
       });
     });
 
@@ -182,6 +186,7 @@ describe(TusService.name, () => {
         visibility: 'timeline',
         livePhotoVideoId: 'video-id',
         sidecarData: 'c2lkZWNhciBjb250ZW50', // sidecarData stays as base64 for us to decode
+        sidecarRequired: 'true',
       };
 
       const result = (sut as any).parseMetadata(metadata);
@@ -198,6 +203,7 @@ describe(TusService.name, () => {
         visibility: 'timeline',
         livePhotoVideoId: 'video-id',
         sidecarData: 'c2lkZWNhciBjb250ZW50',
+        sidecarRequired: 'true',
       });
     });
   });
@@ -362,6 +368,7 @@ describe(TusService.name, () => {
     beforeEach(() => {
       mocks.crypto.randomUUID.mockReturnValue('random-uuid');
       mocks.storage.stat.mockResolvedValue({ size: 1000 } as Stats);
+      mocks.user.get.mockResolvedValue(userStub.user1);
 
       // Mock calculateChecksum to avoid file system access
       vi.spyOn(sut as any, 'calculateChecksum').mockResolvedValue(checksum);
@@ -375,7 +382,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      const result = await (sut as any).createAssetFromUpload(userId, upload);
+      const result = await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(result).toEqual({ assetId: 'asset-id', isDuplicate: false });
       expect(mocks.asset.create).toHaveBeenCalledWith({
@@ -407,7 +414,7 @@ describe(TusService.name, () => {
         originalPath: '/data/upload/existing.jpg',
       });
 
-      const result = await (sut as any).createAssetFromUpload(userId, upload);
+      const result = await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(result).toEqual({ assetId: 'existing-asset-id', isDuplicate: true });
       expect(mocks.asset.create).not.toHaveBeenCalled();
@@ -456,7 +463,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      const result = await (sut as any).createAssetFromUpload(userId, upload);
+      const result = await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(result).toEqual({ assetId: 'asset-id', isDuplicate: false });
       expect(mocks.storage.createOrOverwriteFile).toHaveBeenCalledWith(
@@ -482,7 +489,7 @@ describe(TusService.name, () => {
       mocks.storage.createOrOverwriteFile.mockRejectedValue(new Error('Write error'));
 
       // Should not throw even when sidecar write fails
-      const result = await (sut as any).createAssetFromUpload(userId, upload);
+      const result = await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(result).toEqual({ assetId: 'asset-id', isDuplicate: false });
       // Sidecar file write should have been attempted
@@ -499,7 +506,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.user.updateUsage).toHaveBeenCalledWith(userId, 1000);
     });
@@ -512,7 +519,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.job.queue).toHaveBeenCalledWith({
         name: JobName.AssetExtractMetadata,
@@ -528,7 +535,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.event.emit).toHaveBeenCalledWith('AssetCreate', {
         asset: expect.objectContaining({ id: 'asset-id' }),
@@ -543,7 +550,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -568,7 +575,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -591,7 +598,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -614,7 +621,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -637,7 +644,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -646,27 +653,102 @@ describe(TusService.name, () => {
       );
     });
 
-    it('should set livePhotoVideoId from metadata', async () => {
-      const upload = {
-        ...mockUpload,
-        metadata: {
-          ...mockUpload.metadata,
-          livePhotoVideoId: 'video-id',
-        },
-      };
-
-      mocks.asset.create.mockResolvedValue({
-        id: 'asset-id',
+    it('should associate an owned live photo video and hide it from the timeline', async () => {
+      const videoId = '435f449b-d897-4e23-82dd-f45cd3cc4652';
+      const upload = { ...mockUpload, metadata: { ...mockUpload.metadata, livePhotoVideoId: videoId } };
+      const video = {
+        ...assetStub.image,
+        id: videoId,
         ownerId: userId,
-      } as any);
+        type: AssetType.Video,
+        visibility: AssetVisibility.Timeline,
+      };
+      mocks.asset.getById.mockResolvedValue(video);
+      mocks.asset.create.mockResolvedValue({ ...assetStub.image, ownerId: userId });
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
-      expect(mocks.asset.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          livePhotoVideoId: 'video-id',
-        }),
+      expect(mocks.asset.create).toHaveBeenCalledWith(expect.objectContaining({ livePhotoVideoId: videoId }));
+      expect(mocks.asset.update).toHaveBeenCalledWith({ id: videoId, visibility: AssetVisibility.Hidden });
+      expect(mocks.event.emit).toHaveBeenCalledWith('AssetHide', { assetId: videoId, userId });
+    });
+
+    it('should deny selecting another owner’s live photo video', async () => {
+      mocks.asset.create.mockResolvedValue({ ...assetStub.image, ownerId: userId });
+      const videoId = '435f449b-d897-4e23-82dd-f45cd3cc4652';
+      const upload = { ...mockUpload, metadata: { ...mockUpload.metadata, livePhotoVideoId: videoId } };
+      mocks.asset.getById.mockResolvedValue({
+        ...assetStub.image,
+        id: videoId,
+        ownerId: authStub.user2.user.id,
+        type: AssetType.Video,
+      });
+
+      await expect((sut as any).createAssetFromUpload(userId, upload, checksum)).rejects.toThrow(ForbiddenException);
+      expect(mocks.asset.create).not.toHaveBeenCalled();
+      expect(mocks.asset.update).not.toHaveBeenCalled();
+    });
+
+    it('should verify the registered media size against the latest quota before creating an asset', async () => {
+      mocks.asset.create.mockResolvedValue({ ...assetStub.image, ownerId: userId });
+      mocks.user.get.mockResolvedValue({
+        ...userStub.user1,
+        quotaSizeInBytes: 1200,
+        quotaUsageInBytes: 500,
+      });
+
+      await expect((sut as any).createAssetFromUpload(userId, mockUpload, checksum)).rejects.toThrow(
+        'Quota has been exceeded!',
       );
+      expect(mocks.user.get).toHaveBeenCalledWith(userId, {});
+      expect(mocks.asset.create).not.toHaveBeenCalled();
+      expect(mocks.user.updateUsage).not.toHaveBeenCalled();
+    });
+
+    it('should report a quota rejected finalization as a 400 response', async () => {
+      mocks.asset.create.mockResolvedValue({ ...assetStub.image, ownerId: userId });
+      const upload = { ...mockUpload, offset: mockUpload.size };
+      mocks.storage.readTextFile.mockResolvedValue(JSON.stringify(upload));
+      mocks.user.get.mockResolvedValue({
+        ...userStub.user1,
+        quotaSizeInBytes: 1200,
+        quotaUsageInBytes: 500,
+      });
+      const server = await (sut as any).initializeTusServer();
+
+      await expect(
+        server.options.onUploadFinish({ ...createMockRequest(userId), method: 'PATCH' }, upload),
+      ).rejects.toMatchObject({ status_code: 400, body: 'Quota has been exceeded!' });
+      expect(mocks.asset.create).not.toHaveBeenCalled();
+    });
+
+    it('should require the declared sidecar before registering a resumable asset', async () => {
+      mocks.asset.create.mockResolvedValue({ ...assetStub.image, ownerId: userId });
+      const upload = { ...mockUpload, metadata: { ...mockUpload.metadata, sidecarRequired: 'true' } };
+
+      await expect((sut as any).createAssetFromUpload(userId, upload, checksum)).rejects.toThrow(ConflictException);
+      expect(mocks.asset.create).not.toHaveBeenCalled();
+    });
+
+    it('should move staged sidecar bytes and register them for metadata extraction', async () => {
+      const upload = { ...mockUpload, metadata: { ...mockUpload.metadata, sidecarRequired: 'true' } };
+      const path = '/data/upload/upload-id.jpg';
+      const asset = { ...assetStub.image, ownerId: userId };
+      mocks.asset.create.mockResolvedValue(asset);
+      mocks.storage.checkFileExists.mockImplementation((file) => Promise.resolve(file === `${path}.sidecar`));
+
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
+
+      expect(mocks.storage.rename).toHaveBeenCalledWith(`${path}.sidecar`, `${path}.xmp`);
+      expect(mocks.asset.upsertFile).toHaveBeenCalledWith({
+        assetId: asset.id,
+        path: `${path}.xmp`,
+        type: AssetFileType.Sidecar,
+      });
+      expect(mocks.job.queue).toHaveBeenCalledWith({
+        name: JobName.AssetExtractMetadata,
+        data: { id: asset.id, source: 'upload' },
+      });
     });
 
     it('should update file timestamps', async () => {
@@ -677,7 +759,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.storage.utimes).toHaveBeenCalledWith(
         '/data/upload/upload-id.jpg',
@@ -694,7 +776,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.asset.upsertExif).toHaveBeenCalledWith(
         { assetId: 'asset-id', fileSizeInByte: 1000 },
@@ -711,7 +793,7 @@ describe(TusService.name, () => {
         },
       };
 
-      await expect((sut as any).createAssetFromUpload(userId, upload)).rejects.toThrow(BadRequestException);
+      await expect((sut as any).createAssetFromUpload(userId, upload, checksum)).rejects.toThrow(BadRequestException);
     });
 
     it('should throw BadRequestException if deviceAssetId is missing', async () => {
@@ -723,7 +805,7 @@ describe(TusService.name, () => {
         },
       };
 
-      await expect((sut as any).createAssetFromUpload(userId, upload)).rejects.toThrow(BadRequestException);
+      await expect((sut as any).createAssetFromUpload(userId, upload, checksum)).rejects.toThrow(BadRequestException);
     });
 
     it('should throw BadRequestException if deviceId is missing', async () => {
@@ -735,7 +817,7 @@ describe(TusService.name, () => {
         },
       };
 
-      await expect((sut as any).createAssetFromUpload(userId, upload)).rejects.toThrow(BadRequestException);
+      await expect((sut as any).createAssetFromUpload(userId, upload, checksum)).rejects.toThrow(BadRequestException);
     });
 
     it('should use current date for fileCreatedAt if not provided', async () => {
@@ -753,7 +835,7 @@ describe(TusService.name, () => {
         ownerId: userId,
       } as any);
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.asset.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -773,7 +855,7 @@ describe(TusService.name, () => {
         originalPath: '/data/upload/existing.jpg',
       });
 
-      await (sut as any).createAssetFromUpload(userId, upload);
+      await (sut as any).createAssetFromUpload(userId, upload, checksum);
 
       expect(mocks.user.updateUsage).not.toHaveBeenCalled();
     });
@@ -853,7 +935,7 @@ describe(TusService.name, () => {
       expect(mocks.storage.unlink).toHaveBeenCalledExactlyOnceWith(`${path}.json`);
     });
 
-    it('should remove an expired nested partial upload and its metadata', async () => {
+    it('should remove an expired nested partial upload and its staged sidecar', async () => {
       const path = `/data/upload/${uploadId}`;
       const [owner, first, second, filename] = uploadId.split('/');
       mocks.storage.readdir
@@ -866,9 +948,11 @@ describe(TusService.name, () => {
       );
       mocks.storage.stat.mockResolvedValue({ size: 100 } as Stats);
 
+      mocks.storage.checkFileExists.mockImplementation((file) => Promise.resolve(file === `${path}.sidecar`));
+
       await sut.handleUploadCleanup();
 
-      expect(mocks.storage.unlink.mock.calls).toEqual([[path], [`${path}.json`]]);
+      expect(mocks.storage.unlink.mock.calls).toEqual([[path], [`${path}.sidecar`], [`${path}.json`]]);
     });
 
     it('should leave a transfer alone while another worker holds its upload lock', async () => {

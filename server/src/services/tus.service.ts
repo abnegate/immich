@@ -1,4 +1,12 @@
-import { BadRequestException, Injectable, OnApplicationShutdown } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  HttpException,
+  Injectable,
+  NotFoundException,
+  OnApplicationShutdown,
+} from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
@@ -12,6 +20,7 @@ import { OnJob } from 'src/decorators';
 import { AuthDto } from 'src/dtos/auth.dto';
 import { AssetFileType, AssetVisibility, JobName, JobStatus, QueueName, StorageFolder } from 'src/enum';
 import { BaseService } from 'src/services/base.service';
+import { onBeforeLink } from 'src/utils/asset.util';
 import { isAssetChecksumConstraint } from 'src/utils/database';
 import { mimeTypes } from 'src/utils/mime-types';
 
@@ -41,6 +50,7 @@ interface TusUploadMetadata {
   visibility?: string;
   livePhotoVideoId?: string;
   sidecarData?: string;
+  sidecarRequired?: string;
 }
 
 interface Upload {
@@ -204,6 +214,9 @@ export class TusService extends BaseService implements OnApplicationShutdown {
           }
           return { headers: this.getResultHeaders(result) };
         } catch (error) {
+          if (error instanceof HttpException && error.getStatus() < 500) {
+            throw this.toTusError(error.getStatus(), error.message);
+          }
           this.logger.error(`Failed to finalize upload ${upload.id}: ${error}`);
           throw this.toTusError(500, 'Failed to create asset');
         }
@@ -214,6 +227,69 @@ export class TusService extends BaseService implements OnApplicationShutdown {
   async handleTusOptions(request: Request, response: Response): Promise<void> {
     const server = await this.initializeTusServer();
     await server.handle(request, response);
+  }
+
+  async stageSidecar(auth: AuthDto, request: Request): Promise<void> {
+    const id = this.getUploadId(request.url)?.replace(/\/sidecar$/, '');
+    const owner = id && UPLOAD_ID.exec(id)?.[1];
+    if (!id || !owner) {
+      throw new BadRequestException('Invalid upload ID');
+    }
+    if (owner !== auth.user.id) {
+      throw new ForbiddenException('Upload does not belong to user');
+    }
+
+    const length = request.headers['content-length'];
+    if (request.headers['content-type'] !== 'application/octet-stream' || !length || !/^\d+$/.test(length)) {
+      throw new BadRequestException('A sidecar requires an octet-stream body and Content-Length');
+    }
+    const size = Number(length);
+    if (!Number.isSafeInteger(size)) {
+      throw new BadRequestException('Invalid sidecar Content-Length');
+    }
+
+    let release: Release;
+    try {
+      release = await this.lockUpload(id, true);
+    } catch (error) {
+      switch ((error as NodeJS.ErrnoException).code) {
+        case 'ENOENT': {
+          throw new NotFoundException('Upload not found');
+        }
+        case 'ELOCKED': {
+          throw new ConflictException('Upload in progress');
+        }
+        default: {
+          throw error;
+        }
+      }
+    }
+
+    const path = this.getUploadPath(id);
+    const stage = `${path}.sidecar`;
+    const temporary = `${stage}.tmp`;
+    try {
+      const upload = await this.readUpload(id);
+      if (!upload || this.isExpired(upload)) {
+        throw new NotFoundException('Upload not found');
+      }
+      if (upload.result || (await this.getFileSize(path)) === upload.size) {
+        throw new ConflictException('Upload is already complete');
+      }
+
+      try {
+        await pipeline(request, this.storageRepository.createWriteStream(temporary));
+        if ((await this.getFileSize(temporary)) !== size) {
+          throw new BadRequestException('Sidecar length does not match Content-Length');
+        }
+        await this.storageRepository.rename(temporary, stage);
+      } catch (error) {
+        await this.storageRepository.unlink(temporary);
+        throw error;
+      }
+    } finally {
+      await release();
+    }
   }
 
   async handleTusUpload(auth: AuthDto, request: Request, response: Response): Promise<void> {
@@ -272,6 +348,11 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       }
 
       await server.handle(request, response);
+      if (request.method === 'DELETE' && response.statusCode === 204) {
+        await this.removeStagedSidecar(this.getUploadPath(id)).catch((error: unknown) => {
+          this.logger.warn(`Could not remove the sidecar for canceled upload ${id}: ${error}`);
+        });
+      }
     } finally {
       await release();
     }
@@ -318,9 +399,12 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     return join(StorageCore.getBaseFolder(StorageFolder.Upload), id);
   }
 
-  private async lockUpload(id: string, wait: boolean): Promise<Release> {
-    // The API and the daily cleanup job run in different workers and share the upload volume.
-    const path = this.getUploadPath(id);
+  private lockUpload(id: string, wait: boolean): Promise<Release> {
+    return this.lockPath(this.getUploadPath(id), wait);
+  }
+
+  private async lockPath(path: string, wait: boolean): Promise<Release> {
+    // The API and background workers share the upload volume.
     const deadline = performance.now() + LOCK_RETRY_MS;
     let delay = 50;
     while (true) {
@@ -406,8 +490,21 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       return record.result;
     }
 
-    const result = await this.createAssetFromUpload(userId, upload);
-    const file = `${this.getUploadPath(upload.id)}.json`;
+    const path = this.getUploadPath(upload.id);
+    const checksum = await this.calculateChecksum(path);
+    const directory = StorageCore.getFolderLocation(StorageFolder.Upload, userId);
+    const release = await this.lockPath(join(directory, '.tus-finalization'), true);
+    let result: UploadResult;
+    try {
+      result = await this.createAssetFromUpload(userId, upload, checksum);
+    } finally {
+      await release();
+    }
+
+    if (result.isDuplicate) {
+      await this.removeStagedSidecar(path);
+    }
+    const file = `${path}.json`;
     const temporary = `${file}.tmp`;
     await this.storageRepository.createOrOverwriteFile(temporary, Buffer.from(JSON.stringify({ ...record, result })));
     await this.storageRepository.rename(temporary, file);
@@ -455,6 +552,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
         await this.storageRepository.unlink(path);
       }
     }
+    await this.removeStagedSidecar(path);
     const temporary = `${path}.json.tmp`;
     if (await this.storageRepository.checkFileExists(temporary)) {
       await this.storageRepository.unlink(temporary);
@@ -488,6 +586,7 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       visibility: metadata.visibility ?? undefined,
       livePhotoVideoId: metadata.livePhotoVideoId ?? undefined,
       sidecarData: metadata.sidecarData ?? undefined,
+      sidecarRequired: metadata.sidecarRequired ?? undefined,
     };
   }
 
@@ -511,23 +610,80 @@ export class TusService extends BaseService implements OnApplicationShutdown {
     }
   }
 
-  private async createAssetFromUpload(userId: string, upload: Upload): Promise<UploadResult> {
+  private async removeStagedSidecar(path: string): Promise<void> {
+    for (const file of [`${path}.sidecar`, `${path}.sidecar.tmp`]) {
+      if (await this.storageRepository.checkFileExists(file)) {
+        await this.storageRepository.unlink(file);
+      }
+    }
+  }
+
+  private async attachStagedSidecar(assetId: string, path: string): Promise<boolean> {
+    const staged = `${path}.sidecar`;
+    const destination = `${path}.xmp`;
+    if (await this.storageRepository.checkFileExists(staged)) {
+      await this.storageRepository.rename(staged, destination);
+    } else if (!(await this.storageRepository.checkFileExists(destination))) {
+      return false;
+    }
+    await this.assetRepository.upsertFile({ assetId, path: destination, type: AssetFileType.Sidecar });
+    return true;
+  }
+
+  private async createAssetFromUpload(userId: string, upload: Upload, checksum: Buffer): Promise<UploadResult> {
     const metadata = this.parseMetadata(upload.metadata);
 
     if (!metadata.filename || !metadata.deviceAssetId || !metadata.deviceId) {
       throw new BadRequestException('Missing required metadata');
     }
 
-    const uploadPath = StorageCore.getBaseFolder(StorageFolder.Upload);
-    const filePath = join(uploadPath, upload.id);
-
-    // Calculate checksum
-    const checksum = await this.calculateChecksum(filePath);
+    const filePath = this.getUploadPath(upload.id);
 
     // Check for duplicate
     const existingAssetId = await this.assetRepository.getUploadAssetIdByChecksum(userId, checksum);
     if (existingAssetId) {
-      return this.getExistingUploadResult(userId, existingAssetId, filePath);
+      const result = await this.getExistingUploadResult(userId, existingAssetId, filePath);
+      if (!result.isDuplicate && metadata.sidecarRequired === 'true') {
+        if (!(await this.attachStagedSidecar(result.assetId, filePath))) {
+          throw new ConflictException('Stage the sidecar before completing the upload');
+        }
+        await this.jobRepository.queue({
+          name: JobName.AssetExtractMetadata,
+          data: { id: result.assetId, source: 'upload' },
+        });
+      }
+      return result;
+    }
+
+    const { size: fileSize } = await this.storageRepository.stat(filePath);
+    if (upload.size !== fileSize) {
+      throw new BadRequestException('The uploaded file does not match Upload-Length');
+    }
+    const user = await this.userRepository.get(userId, {});
+    if (!user) {
+      throw new ForbiddenException('Upload owner is unavailable');
+    }
+    if (user.quotaSizeInBytes !== null && user.quotaUsageInBytes + fileSize > user.quotaSizeInBytes) {
+      throw new BadRequestException('Quota has been exceeded!');
+    }
+
+    const hasStagedSidecar = await this.storageRepository.checkFileExists(`${filePath}.sidecar`);
+    if (metadata.sidecarRequired === 'true' && !hasStagedSidecar) {
+      throw new ConflictException('Stage the sidecar before completing the upload');
+    }
+
+    if (metadata.livePhotoVideoId) {
+      if (!OWNER.test(metadata.livePhotoVideoId)) {
+        throw new BadRequestException('Invalid live photo video ID');
+      }
+      const motion = await this.assetRepository.getById(metadata.livePhotoVideoId);
+      if (motion?.ownerId !== userId) {
+        throw new ForbiddenException('Live photo video does not belong to the user');
+      }
+      await onBeforeLink(
+        { asset: this.assetRepository, event: this.eventRepository },
+        { userId, livePhotoVideoId: metadata.livePhotoVideoId },
+      );
     }
 
     const parseDate = (dateString: string | undefined): Date => {
@@ -590,41 +746,28 @@ export class TusService extends BaseService implements OnApplicationShutdown {
       return this.getExistingUploadResult(userId, assetId, filePath);
     }
 
-    // Handle sidecar if provided as base64 in metadata
-    if (metadata.sidecarData) {
+    // Account for the registered asset before sidecar processing can fail.
+    await this.userRepository.updateUsage(userId, fileSize);
+
+    await this.storageRepository.utimes(filePath, new Date(), fileModifiedAt);
+    await this.assetRepository.upsertExif(
+      { assetId: asset.id, fileSizeInByte: fileSize },
+      { lockedPropertiesBehavior: 'override' },
+    );
+
+    if (hasStagedSidecar) {
+      if (!(await this.attachStagedSidecar(asset.id, filePath))) {
+        throw new ConflictException('Stage the sidecar before completing the upload');
+      }
+    } else if (metadata.sidecarData) {
+      const sidecarPath = `${filePath}.xmp`;
       try {
-        const sidecarBuffer = Buffer.from(metadata.sidecarData, 'base64');
-        const sidecarPath = filePath + '.xmp';
-        await this.storageRepository.createOrOverwriteFile(sidecarPath, sidecarBuffer);
-        await this.assetRepository.upsertFile({
-          assetId: asset.id,
-          path: sidecarPath,
-          type: AssetFileType.Sidecar,
-        });
+        await this.storageRepository.createOrOverwriteFile(sidecarPath, Buffer.from(metadata.sidecarData, 'base64'));
+        await this.assetRepository.upsertFile({ assetId: asset.id, path: sidecarPath, type: AssetFileType.Sidecar });
       } catch (error) {
         this.logger.warn(`Failed to save sidecar for asset ${asset.id}: ${error}`);
       }
     }
-
-    // Update file timestamps
-    await this.storageRepository.utimes(filePath, new Date(), fileModifiedAt);
-
-    // Update exif with file size
-    let fileSize = 0;
-    try {
-      const stats = await this.storageRepository.stat(filePath);
-      fileSize = stats.size;
-      await this.assetRepository.upsertExif(
-        { assetId: asset.id, fileSizeInByte: stats.size },
-        { lockedPropertiesBehavior: 'override' },
-      );
-    } catch (error) {
-      this.logger.error(`Failed to get file stats for ${filePath}: ${error}`);
-      // Continue with default file size of 0 rather than failing the entire upload
-    }
-
-    // Update user quota
-    await this.userRepository.updateUsage(userId, fileSize);
 
     // Emit event
     await this.eventRepository.emit('AssetCreate', { asset });
