@@ -6,7 +6,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { describe, expect, it, MockedFunction, vi } from 'vitest';
 
 import { Action, checkBulkUpload, defaults, getSupportedMediaTypes, Reason } from '@immich/sdk';
-import { DetailedError, type HttpResponse, type PreviousUpload, type Upload } from 'tus-js-client';
+import { DefaultHttpStack, DetailedError, type HttpResponse, type PreviousUpload, type Upload } from 'tus-js-client';
 import createFetchMock from 'vitest-fetch-mock';
 
 import { checkForDuplicates, getAlbumName, startWatch, uploadFiles, UploadOptionsDto } from 'src/commands/asset';
@@ -14,6 +14,7 @@ import { checkForDuplicates, getAlbumName, startWatch, uploadFiles, UploadOption
 vi.mock('@immich/sdk');
 vi.mock('node:fs/promises', { spy: true });
 type UploadOptions = ConstructorParameters<typeof Upload>[1];
+const NativeResponse = globalThis.Response;
 
 const { startUpload, findPreviousUploads } = vi.hoisted(() => ({
   startUpload: vi.fn<(options: UploadOptions) => void>(),
@@ -363,7 +364,7 @@ describe('uploadFiles with resumable option', () => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-resumable-'));
     testFilePath = path.join(testDir, 'test.png');
     mediumTestFilePath = path.join(testDir, 'medium-test.png');
-    largeTestFilePath = path.join(testDir, 'large-test.png');
+    largeTestFilePath = path.join(testDir, 'large-test.mp4');
 
     fs.writeFileSync(testFilePath, 'small file data');
     fs.writeFileSync(mediumTestFilePath, '');
@@ -591,6 +592,141 @@ describe('uploadFiles with resumable option', () => {
 
     it('should return empty array for empty file list', async () => {
       await expect(uploadFiles([], { concurrency: 1 })).resolves.toEqual([]);
+    });
+  });
+
+  describe('resumable XMP sidecars', () => {
+    const uploadUrl = `${baseUrl}/upload/user-id/ab/cd/video-id`;
+    const xmp = [
+      '<x:xmpmeta xmlns:x="adobe:ns:meta/">',
+      '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">',
+      '<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">',
+      '<dc:description><rdf:Alt><rdf:li xml:lang="x-default">',
+      'Extended video description for archival metadata. '.repeat(400),
+      '</rdf:li></rdf:Alt></dc:description>',
+      '</rdf:Description></rdf:RDF></x:xmpmeta>',
+    ].join('');
+    const stack = new DefaultHttpStack({});
+
+    beforeEach(() => {
+      fs.writeFileSync(path.join(testDir, 'large-test.xmp'), xmp);
+    });
+
+    it('stages a large XMP body once before sending media chunks', async () => {
+      expect(Buffer.byteLength(xmp)).toBeGreaterThan(16_384);
+      fetchMocker.doMockIf(`${uploadUrl}/sidecar`, () => ({ status: 204 }));
+      const create = stack.createRequest('POST', `${baseUrl}/upload`);
+      const head = stack.createRequest('HEAD', uploadUrl);
+      const created = response({ location: uploadUrl }, 201);
+      const partial = response({ 'upload-length': String(75 * 1024 * 1024), 'upload-offset': '0' });
+      startUpload.mockImplementation((options) => {
+        void Promise.resolve(options.onAfterResponse?.(create, created))
+          .then(() => options.onAfterResponse?.(head, partial))
+          .then(() => options.onSuccess?.({ lastResponse: response({ 'x-immich-asset-id': 'video-asset-id' }) }))
+          .catch((error: Error) => options.onError?.(error));
+      });
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
+        { filepath: largeTestFilePath, id: 'video-asset-id' },
+      ]);
+      const metadata = startUpload.mock.calls[0][0].metadata;
+      expect(metadata).toMatchObject({ sidecarRequired: 'true' });
+      expect(metadata).not.toHaveProperty('sidecarData');
+      expect(fetchMocker).toHaveBeenCalledOnce();
+      const [url, options] = fetchMocker.mock.calls[0];
+      expect(url.toString()).toBe(`${uploadUrl}/sidecar`);
+      expect(options?.method).toBe('PUT');
+      expect(options?.redirect).toBe('error');
+      const headers = new Headers(options?.headers);
+      expect(headers.get('x-api-key')).toBe(apiKey);
+      expect(headers.get('content-type')).toBe('application/octet-stream');
+      expect(headers.get('content-length')).toBe(String(Buffer.byteLength(xmp)));
+      const body = options?.body as File;
+      expect(await new NativeResponse(body.stream()).text()).toBe(xmp);
+    });
+
+    it('does not complete media when XMP staging fails', async () => {
+      fetchMocker.doMockIf(`${uploadUrl}/sidecar`, () => ({ status: 413 }));
+      const create = stack.createRequest('POST', `${baseUrl}/upload`);
+      const created = response({ location: uploadUrl }, 201);
+      const sendPatch = vi.fn();
+      startUpload.mockImplementation((options) => {
+        void Promise.resolve(options.onAfterResponse?.(create, created))
+          .then(() => {
+            sendPatch();
+            options.onSuccess?.({ lastResponse: response({ 'x-immich-asset-id': 'video-asset-id' }) });
+          })
+          .catch((error: Error) => options.onError?.(error));
+      });
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([]);
+      expect(sendPatch).not.toHaveBeenCalled();
+    });
+
+    it('does not forward credentials to a different origin', async () => {
+      const patch = stack.createRequest('PATCH', 'http://different.example/upload/video-id');
+      const sendPatch = vi.fn();
+      startUpload.mockImplementation((options) => {
+        void Promise.resolve(options.onBeforeRequest?.(patch))
+          .then(() => {
+            sendPatch();
+            options.onSuccess?.({ lastResponse: response({ 'x-immich-asset-id': 'video-asset-id' }) });
+          })
+          .catch((error: Error) => options.onError?.(error));
+      });
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([]);
+      expect(sendPatch).not.toHaveBeenCalled();
+      expect(fetchMocker).not.toHaveBeenCalled();
+    });
+
+    it('recognizes a completed resume that already included its sidecar', async () => {
+      findPreviousUploads.mockResolvedValueOnce([
+        {
+          uploadUrl,
+          metadata: { sidecarRequired: 'true' },
+          size: 75 * 1024 * 1024,
+          creationTime: '',
+          urlStorageKey: 'previous',
+          parallelUploadUrls: null, // eslint-disable-line unicorn/no-null -- tus expects null for non-parallel transfers.
+        },
+      ]);
+      const head = stack.createRequest('HEAD', uploadUrl);
+      const size = String(75 * 1024 * 1024);
+      const lastResponse = response({
+        'upload-length': size,
+        'upload-offset': size,
+        'x-immich-asset-id': 'video-asset-id',
+      });
+      startUpload.mockImplementation((options) => {
+        void Promise.resolve(options.onAfterResponse?.(head, lastResponse))
+          .then(() => options.onSuccess?.({ lastResponse }))
+          .catch((error: Error) => options.onError?.(error));
+      });
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
+        { filepath: largeTestFilePath, id: 'video-asset-id' },
+      ]);
+      expect(fetchMocker).not.toHaveBeenCalled();
+    });
+
+    it('rejects a completed response when the required sidecar was never staged', async () => {
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([]);
+    });
+
+    it('preserves the multipart sidecar when the tus endpoint is unavailable', async () => {
+      startUpload.mockImplementation((options) => options.onError?.(uploadError('POST', 404)));
+      fetchMocker.doMockIf(`${baseUrl}/assets`, () => ({
+        status: 201,
+        body: JSON.stringify({ id: 'multipart-asset-id', status: 'created' }),
+      }));
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
+        { filepath: largeTestFilePath, id: 'multipart-asset-id' },
+      ]);
+      expect(fetchMocker).toHaveBeenCalledOnce();
+      const body = fetchMocker.mock.calls[0][1]?.body as FormData;
+      expect(body.get('sidecarData')).toEqual(expect.objectContaining({ size: Buffer.byteLength(xmp) }));
     });
   });
 

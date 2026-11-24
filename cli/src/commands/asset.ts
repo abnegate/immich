@@ -463,13 +463,19 @@ const uploadFileResumable = async (
   onProgress?: (bytesUploaded: number) => void,
 ): Promise<AssetMediaResponseDto | void> => {
   const { baseUrl, headers } = defaults;
+  const endpoint = `${baseUrl}/upload`;
+  const origin = new URL(endpoint).origin;
+  const validateUploadUrl = (value: string, base = endpoint): URL => {
+    const url = new URL(value, base);
+    if (url.origin !== origin) {
+      throw new Error('The resumable upload URL has a different origin than the Immich server');
+    }
+    return url;
+  };
 
   const sidecarPath = await getSidecarPath(input);
-  let sidecarData: string | undefined;
-  if (sidecarPath) {
-    const sidecarBuffer = await readFile(sidecarPath);
-    sidecarData = sidecarBuffer.toString('base64');
-  }
+  const sidecarStats = sidecarPath ? await stat(sidecarPath) : undefined;
+  const sidecar = sidecarPath && sidecarStats?.size ? new UploadFile(sidecarPath, sidecarStats.size) : undefined;
 
   const deviceAssetId = `${basename(input)}-${stats.size}`.replaceAll(/\s+/g, '');
 
@@ -477,8 +483,10 @@ const uploadFileResumable = async (
   try {
     return await new Promise<AssetMediaResponseDto | void>((resolve, reject) => {
       let hasUploadUrl = false;
+      let stagedUrl: string | undefined;
+      let resumedWithSidecar = false;
       const upload = new tus.Upload(file, {
-        endpoint: `${baseUrl}/upload`,
+        endpoint,
         headers: headers as Record<string, string>,
         uploadSize: stats.size,
         chunkSize: RESUMABLE_CHUNK_SIZE,
@@ -490,13 +498,66 @@ const uploadFileResumable = async (
           fileCreatedAt: stats.mtime.toISOString(),
           fileModifiedAt: stats.mtime.toISOString(),
           isFavorite: 'false',
-          ...(sidecarData && { sidecarData }),
+          ...(sidecar && { sidecarRequired: 'true' }),
         },
         storeFingerprintForResuming: true,
         urlStorage,
         removeFingerprintOnSuccess: true,
         onUploadUrlAvailable: () => {
           hasUploadUrl = true;
+        },
+        onBeforeRequest: (request) => {
+          validateUploadUrl(request.getURL());
+        },
+        onAfterResponse: async (request, response) => {
+          const status = response.getStatus();
+          if (!sidecar || status < 200 || status >= 300) {
+            return;
+          }
+
+          const method = request.getMethod();
+          let location: string | undefined;
+          if (method === 'POST') {
+            location = response.getHeader('Location');
+          } else if (method === 'HEAD') {
+            const offset = Number(response.getHeader('Upload-Offset'));
+            const length = Number(response.getHeader('Upload-Length'));
+            if (offset < length) {
+              location = request.getURL();
+            }
+          }
+          if (!location) {
+            return;
+          }
+
+          const url = validateUploadUrl(location, request.getURL());
+          const uploadUrl = url.href;
+          if (stagedUrl === uploadUrl) {
+            return;
+          }
+
+          if (method === 'POST') {
+            // Keep the created URL so a failed sidecar request can retry the same upload.
+            hasUploadUrl = true;
+            upload.url = uploadUrl;
+          }
+
+          url.pathname += '/sidecar';
+          const sidecarHeaders = new Headers(headers as Record<string, string>);
+          sidecarHeaders.set('Content-Type', 'application/octet-stream');
+          sidecarHeaders.set('Content-Length', String(sidecar.size));
+
+          const sidecarResponse = await fetch(url, {
+            method: 'PUT',
+            redirect: 'error',
+            headers: sidecarHeaders,
+            body: sidecar,
+          });
+          if (sidecarResponse.status !== 204) {
+            throw new Error(`Failed to stage XMP sidecar (HTTP ${sidecarResponse.status})`);
+          }
+
+          stagedUrl = uploadUrl;
         },
         onError: (error) => {
           if (!hasUploadUrl && error instanceof tus.DetailedError && error.originalRequest?.getMethod() === 'POST') {
@@ -511,6 +572,11 @@ const uploadFileResumable = async (
         },
         onProgress,
         onSuccess: ({ lastResponse }) => {
+          if (sidecar && !stagedUrl && !resumedWithSidecar) {
+            reject(new Error('The completed resumable upload has no XMP sidecar'));
+            return;
+          }
+
           const id = lastResponse.getHeader('X-Immich-Asset-Id');
           if (!id) {
             reject(new Error('Resumable upload response did not include an asset ID'));
@@ -529,6 +595,8 @@ const uploadFileResumable = async (
         .then(([previous]) => {
           if (previous?.uploadUrl) {
             hasUploadUrl = true;
+            resumedWithSidecar =
+              previous.metadata?.sidecarRequired === 'true' || Boolean(previous.metadata?.sidecarData);
             upload.resumeFromPreviousUpload(previous);
           }
           upload.start();
