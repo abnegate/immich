@@ -88,7 +88,7 @@ program
       .implies({ progress: false }),
   )
   .addOption(
-    new Option('--resumable', 'Use resumable uploads for large files (>10MB)')
+    new Option('--resumable', 'Use resumable uploads for files of at least 50 MiB')
       .env('IMMICH_RESUMABLE_UPLOAD')
       .default(false),
   )

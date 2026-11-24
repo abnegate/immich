@@ -42,8 +42,8 @@ export const addDummyItems = () => {
 
 // addDummyItems();
 
-// Threshold for using resumable uploads (50 MB) - matches mobile and CLI
-const RESUMABLE_UPLOAD_THRESHOLD = 50 * 1024 * 1024;
+const RESUMABLE_CHUNK_SIZE = 50 * 1024 * 1024;
+const activeUploads = new Map<string, () => void>();
 
 export const uploadExecutionQueue = new ExecutorQueue({ concurrency: 2 });
 
@@ -120,29 +120,16 @@ type FileUploaderParams = {
   deviceAssetId: string;
 };
 
-/**
- * Upload a file using tus resumable protocol
- * @param assetFile The file to upload
- * @param deviceAssetId Unique identifier for the asset
- * @param fileCreatedAt ISO timestamp of file creation
- * @param onProgress Progress callback
- * @param isLockedAssets Whether this is a locked asset
- * @returns Promise resolving to asset response data and the upload instance for cancellation
- */
 async function uploadFileResumable(
   assetFile: File,
   deviceAssetId: string,
   fileCreatedAt: string,
   onProgress: (bytesUploaded: number, bytesTotal: number) => void,
   isLockedAssets = false,
-): Promise<AssetMediaResponseDto> {
-  const baseUrl = getBaseUrl();
-  const queryParams = asQueryString(authManager.params);
-
-  // Build metadata for tus upload
+): Promise<AssetMediaResponseDto | undefined> {
   const metadata: Record<string, string> = {
     filename: assetFile.name,
-    filetype: assetFile.type || '',
+    filetype: assetFile.type,
     deviceAssetId,
     deviceId: 'WEB',
     fileCreatedAt,
@@ -155,91 +142,93 @@ async function uploadFileResumable(
     metadata.visibility = AssetVisibility.Locked;
   }
 
-  return new Promise<AssetMediaResponseDto>((resolve, reject) => {
-    const upload = new tus.Upload(assetFile, {
-      endpoint: `${baseUrl}/upload${queryParams ? `?${queryParams}` : ''}`,
-      metadata,
-      chunkSize: 50 * 1024 * 1024, // 50MB chunks
-      removeFingerprintOnSuccess: true,
-      // Store upload URL in localStorage to enable resuming
-      storeFingerprintForResuming: true,
-      // Include credentials (cookies) for authentication
-      headers: {},
-      onError: (error) => {
-        // Clean up from active uploads map on error
-        activeUploads.delete(deviceAssetId);
-        reject(error);
-      },
-      onProgress: (bytesUploaded, bytesTotal) => {
-        onProgress(bytesUploaded, bytesTotal);
-      },
-      onSuccess: () => {
-        // Clean up from active uploads map
-        activeUploads.delete(deviceAssetId);
-
-        // Try to get X-Immich-Asset-Id and X-Immich-Duplicate headers from the upload response
-        // The tus-js-client library doesn't expose response headers cleanly,
-        // so we need to access the internal XHR object as a workaround
-        // TODO: This should be replaced with a proper API when tus-js-client provides header access
-        let responseAssetId: string | null = null;
-        let isDuplicate = false;
-        try {
-          const xhr = (upload as any)._xhr;
-          if (xhr && typeof xhr.getResponseHeader === 'function') {
-            responseAssetId = xhr.getResponseHeader('X-Immich-Asset-Id') ||
-                             xhr.getResponseHeader('x-immich-asset-id');
-            const duplicateHeader = xhr.getResponseHeader('X-Immich-Duplicate') ||
-                                   xhr.getResponseHeader('x-immich-duplicate');
-            isDuplicate = duplicateHeader?.toLowerCase() === 'true';
+  let cancel: (() => void) | undefined;
+  try {
+    return await new Promise<AssetMediaResponseDto | undefined>((resolve, reject) => {
+      let hasUploadUrl = false;
+      let canceled = false;
+      const cancellation = new DOMException('Upload canceled', 'AbortError');
+      const upload = new tus.Upload(assetFile, {
+        endpoint: `${getBaseUrl()}/upload`,
+        metadata,
+        chunkSize: RESUMABLE_CHUNK_SIZE,
+        removeFingerprintOnSuccess: true,
+        storeFingerprintForResuming: true,
+        onUploadUrlAvailable: () => {
+          hasUploadUrl = true;
+        },
+        onBeforeRequest: async () => {
+          if (canceled) {
+            // tus can finish preparing its file source after abort() is called.
+            await upload.abort();
+            throw cancellation;
           }
-        } catch (error) {
-          console.warn('Failed to extract headers from response:', error);
-        }
+        },
+        onError: (error) => {
+          if (!hasUploadUrl && error instanceof tus.DetailedError && error.originalRequest?.getMethod() === 'POST') {
+            const status = error.originalResponse?.getStatus();
+            if (status === 404 || status === 405) {
+              resolve(undefined);
+              return;
+            }
+          }
 
-        // Fallback to extracting from upload URL if header is not available
-        if (!responseAssetId) {
-          const uploadUrl = upload.url;
-          responseAssetId = uploadUrl?.split('/').pop() || '';
-        }
+          reject(error);
+        },
+        onProgress,
+        onSuccess: ({ lastResponse }) => {
+          const id = lastResponse.getHeader('X-Immich-Asset-Id');
+          if (!id) {
+            reject(new Error('Resumable upload response did not include an asset ID'));
+            return;
+          }
 
-        resolve({
-          id: responseAssetId,
-          status: isDuplicate ? AssetMediaStatus.Duplicate : AssetMediaStatus.Created,
-        });
-      },
+          const duplicate = lastResponse.getHeader('X-Immich-Duplicate')?.toLowerCase() === 'true';
+          resolve({ id, status: duplicate ? AssetMediaStatus.Duplicate : AssetMediaStatus.Created });
+        },
+      });
+
+      cancel = () => {
+        canceled = true;
+        reject(cancellation);
+        void upload.abort().catch(console.error);
+      };
+      activeUploads.set(deviceAssetId, cancel);
+
+      void upload
+        .findPreviousUploads()
+        .catch((error) => {
+          console.warn('Could not check for previous uploads:', error);
+          upload.options.storeFingerprintForResuming = false;
+          return [];
+        })
+        .then((previousUploads) => {
+          if (canceled) {
+            return;
+          }
+
+          const previous = previousUploads.find(
+            (previous) => previous.uploadUrl && previous.metadata.visibility === metadata.visibility,
+          );
+          if (previous) {
+            hasUploadUrl = true;
+            upload.resumeFromPreviousUpload(previous);
+          }
+          upload.start();
+        })
+        .catch(reject);
     });
-
-    // Store upload instance for potential cancellation
-    (upload as any)._deviceAssetId = deviceAssetId;
-    activeUploads.set(deviceAssetId, upload);
-
-    // Enable resumable uploads by checking for previous uploads
-    upload.findPreviousUploads().then((previousUploads) => {
-      if (previousUploads.length > 0) {
-        upload.resumeFromPreviousUpload(previousUploads[0]);
-      }
-      upload.start();
-    }).catch((error) => {
-      // If finding previous uploads fails, just start fresh
-      console.warn('Could not check for previous uploads:', error);
-      upload.start();
-    });
-  });
+  } finally {
+    if (activeUploads.get(deviceAssetId) === cancel) {
+      activeUploads.delete(deviceAssetId);
+    }
+  }
 }
 
-// Track active tus uploads for cancellation support
-const activeUploads = new Map<string, tus.Upload>();
-
-/**
- * Cancel an active upload
- * @param deviceAssetId The device asset ID of the upload to cancel
- */
 export function cancelUpload(deviceAssetId: string): void {
-  const upload = activeUploads.get(deviceAssetId);
-  if (upload) {
-    upload.abort();
-    activeUploads.delete(deviceAssetId);
-  }
+  const cancel = activeUploads.get(deviceAssetId);
+  activeUploads.delete(deviceAssetId);
+  cancel?.();
 }
 
 // TODO: should probably use the @api SDK
@@ -255,23 +244,6 @@ async function fileUploader({
   uploadAssetsStore.markStarted(deviceAssetId);
 
   try {
-    const formData = new FormData();
-    for (const [key, value] of Object.entries({
-      deviceAssetId,
-      deviceId: 'WEB',
-      fileCreatedAt,
-      fileModifiedAt: new Date(assetFile.lastModified).toISOString(),
-      isFavorite: 'false',
-      duration: '0:00:00.000000',
-      assetData: new File([assetFile], assetFile.name),
-    })) {
-      formData.append(key, value);
-    }
-
-    if (isLockedAssets) {
-      formData.append('visibility', AssetVisibility.Locked);
-    }
-
     let responseData: { id: string; status: AssetMediaStatus; isTrashed?: boolean } | undefined;
     if (crypto?.subtle?.digest && !authManager.isSharedLink) {
       uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_hashing') });
@@ -301,8 +273,7 @@ async function fileUploader({
     if (!responseData) {
       uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_uploading') });
 
-      // Use resumable upload for files larger than 10MB
-      if (assetFile.size >= RESUMABLE_UPLOAD_THRESHOLD) {
+      if (!authManager.isSharedLink && assetFile.size >= RESUMABLE_CHUNK_SIZE) {
         responseData = await uploadFileResumable(
           assetFile,
           deviceAssetId,
@@ -310,8 +281,26 @@ async function fileUploader({
           (bytesUploaded, bytesTotal) => uploadAssetsStore.updateProgress(deviceAssetId, bytesUploaded, bytesTotal),
           isLockedAssets,
         );
-      } else {
-        // Use multipart upload for smaller files
+      }
+
+      if (!responseData) {
+        const formData = new FormData();
+        for (const [key, value] of Object.entries({
+          deviceAssetId,
+          deviceId: 'WEB',
+          fileCreatedAt,
+          fileModifiedAt: fileCreatedAt,
+          isFavorite: 'false',
+          duration: '0:00:00.000000',
+          assetData: new File([assetFile], assetFile.name),
+        })) {
+          formData.append(key, value);
+        }
+
+        if (isLockedAssets) {
+          formData.append('visibility', AssetVisibility.Locked);
+        }
+
         const queryParams = asQueryString(authManager.params);
         const response = await uploadRequest<AssetMediaResponseDto>({
           url: getBaseUrl() + '/assets' + (queryParams ? `?${queryParams}` : ''),
@@ -353,6 +342,11 @@ async function fileUploader({
 
     return responseData.id;
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      uploadAssetsStore.removeItem(deviceAssetId);
+      return;
+    }
+
     // ignore errors if the user logs out during uploads
     if (!get(user)) {
       return;

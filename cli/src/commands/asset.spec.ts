@@ -1,52 +1,54 @@
 import * as fs from 'node:fs';
+import { mkdir, readFile } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { describe, expect, it, MockedFunction, vi } from 'vitest';
 
 import { Action, checkBulkUpload, defaults, getSupportedMediaTypes, Reason } from '@immich/sdk';
+import { DetailedError, type HttpResponse, type PreviousUpload, type Upload } from 'tus-js-client';
 import createFetchMock from 'vitest-fetch-mock';
 
 import { checkForDuplicates, getAlbumName, startWatch, uploadFiles, UploadOptionsDto } from 'src/commands/asset';
 
 vi.mock('@immich/sdk');
-vi.mock('tus-js-client', () => ({
-  Upload: class MockUpload {
-    private options: any;
-    url = 'http://example.com/upload/test-upload-id';
+vi.mock('node:fs/promises', { spy: true });
+type UploadOptions = ConstructorParameters<typeof Upload>[1];
 
-    constructor(_fileStream: any, options: any) {
-      this.options = options;
-    }
+const { startUpload, findPreviousUploads } = vi.hoisted(() => ({
+  startUpload: vi.fn<(options: UploadOptions) => void>(),
+  findPreviousUploads: vi.fn<() => Promise<PreviousUpload[]>>(),
+}));
+
+vi.mock('tus-js-client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('tus-js-client')>()),
+  Upload: class MockUpload {
+    constructor(
+      _file: fs.ReadStream,
+      private readonly options: UploadOptions,
+    ) {}
 
     start() {
-      // Simulate onAfterResponse with asset ID header
-      if (this.options.onAfterResponse) {
-        this.options.onAfterResponse(null, {
-          getHeader: (name: string) => {
-            if (name === 'x-immich-asset-id') return 'test-upload-id';
-            if (name === 'x-immich-duplicate') return 'false';
-            return null;
-          },
-        });
-      }
-      // Simulate successful upload after a tick
-      setTimeout(() => {
-        if (this.options.onSuccess) {
-          this.options.onSuccess();
-        }
-      }, 0);
+      startUpload(this.options);
     }
 
-    abort() {}
-
-    findPreviousUploads() {
-      return Promise.resolve([]);
-    }
-
+    findPreviousUploads = findPreviousUploads;
     resumeFromPreviousUpload() {}
   },
 }));
+
+const response = (headers: Record<string, string> = {}, status = 200): HttpResponse => ({
+  getHeader: (header) => headers[header.toLowerCase()],
+  getStatus: () => status,
+  getBody: () => '',
+  getUnderlyingObject: vi.fn(),
+});
+
+const uploadError = (method: string, status: number): DetailedError =>
+  Object.assign(new DetailedError('Upload failed'), {
+    originalRequest: { getMethod: () => method },
+    originalResponse: response({}, status),
+  });
 
 describe('getAlbumName', () => {
   it('should return a non-undefined value', () => {
@@ -352,9 +354,6 @@ describe('uploadFiles with resumable option', () => {
   let testFilePath: string;
   let mediumTestFilePath: string;
   let largeTestFilePath: string;
-  const smallTestFileData = 'small file data'; // Few bytes (well under 50MB threshold)
-  const mediumTestFileData = 'a'.repeat(25 * 1024 * 1024); // 25MB (under 50MB threshold - single request)
-  const largeTestFileData = 'a'.repeat(75 * 1024 * 1024); // 75MB (over 50MB threshold - requires chunking)
   const baseUrl = 'http://example.com';
   const apiKey = 'key';
 
@@ -366,9 +365,18 @@ describe('uploadFiles with resumable option', () => {
     mediumTestFilePath = path.join(testDir, 'medium-test.png');
     largeTestFilePath = path.join(testDir, 'large-test.png');
 
-    fs.writeFileSync(testFilePath, smallTestFileData);
-    fs.writeFileSync(mediumTestFilePath, mediumTestFileData);
-    fs.writeFileSync(largeTestFilePath, largeTestFileData);
+    fs.writeFileSync(testFilePath, 'small file data');
+    fs.writeFileSync(mediumTestFilePath, '');
+    fs.truncateSync(mediumTestFilePath, 25 * 1024 * 1024);
+    fs.writeFileSync(largeTestFilePath, '');
+    fs.truncateSync(largeTestFilePath, 75 * 1024 * 1024);
+
+    startUpload
+      .mockReset()
+      .mockImplementation((options) =>
+        options.onSuccess?.({ lastResponse: response({ 'x-immich-asset-id': 'test-asset-id' }) }),
+      );
+    findPreviousUploads.mockReset().mockResolvedValue([]);
 
     vi.mocked(defaults).baseUrl = baseUrl;
     vi.mocked(defaults).headers = { 'x-api-key': apiKey };
@@ -433,15 +441,15 @@ describe('uploadFiles with resumable option', () => {
   });
 
   describe('large files (over 50MB threshold)', () => {
-    it('should use TUS resumable upload for 75MB file (over 50MB threshold)', async () => {
-      // Large files use TUS protocol via the mocked tus-js-client
-      // The mock returns a URL with test-upload-id
+    it('returns the canonical asset ID from the completed response', async () => {
       await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
         {
           filepath: largeTestFilePath,
-          id: 'test-upload-id',
+          id: 'test-asset-id',
         },
       ]);
+      expect(startUpload).toHaveBeenCalledWith(expect.objectContaining({ chunkSize: 50 * 1024 * 1024 }));
+      expect(fetchMocker).not.toHaveBeenCalled();
     });
 
     it('should use multipart for large file when resumable is false', async () => {
@@ -458,6 +466,73 @@ describe('uploadFiles with resumable option', () => {
           id: 'large-multipart-id',
         },
       ]);
+    });
+
+    it('starts an upload if resume storage is unavailable', async () => {
+      findPreviousUploads.mockRejectedValueOnce(new Error('Resume storage unavailable'));
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
+        { filepath: largeTestFilePath, id: 'test-asset-id' },
+      ]);
+      expect(startUpload).toHaveBeenCalledOnce();
+    });
+
+    it('keeps transfer available when storing a resume URL fails', async () => {
+      await uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true });
+      const storage = startUpload.mock.calls[0][0].urlStorage;
+      expect(storage).toBeDefined();
+      vi.mocked(mkdir).mockRejectedValueOnce(new Error('Resume directory unavailable'));
+
+      await expect(
+        storage!.addUpload('test-key', {
+          uploadUrl: 'http://example.com/upload/pending',
+          metadata: {},
+          size: 75 * 1024 * 1024,
+          creationTime: '',
+          urlStorageKey: '',
+          parallelUploadUrls: null, // eslint-disable-line unicorn/no-null -- tus expects null for non-parallel transfers.
+        }),
+      ).resolves.toBe('');
+    });
+
+    it('returns the storage key needed to remove a resumed upload after completion', async () => {
+      await uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true });
+      const storage = startUpload.mock.calls[0][0].urlStorage;
+      expect(storage).toBeDefined();
+      vi.mocked(mkdir).mockResolvedValueOnce('unused-cache-directory');
+      vi.mocked(readFile).mockResolvedValueOnce(JSON.stringify({ uploadUrl: 'http://example.com/upload/pending' }));
+
+      await expect(storage!.findUploadsByFingerprint('test-key')).resolves.toEqual([
+        { uploadUrl: 'http://example.com/upload/pending', urlStorageKey: 'test-key' },
+      ]);
+    });
+
+    it('uses multipart when the server has no tus creation endpoint', async () => {
+      startUpload.mockImplementationOnce((options) => options.onError?.(uploadError('POST', 405)));
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => ({
+        status: 201,
+        body: JSON.stringify({ id: 'multipart-id', status: 'created' }),
+      }));
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([
+        { filepath: largeTestFilePath, id: 'multipart-id' },
+      ]);
+      expect(startUpload).toHaveBeenCalledOnce();
+      expect(fetchMocker).toHaveBeenCalledOnce();
+    });
+
+    it('reports a failed PATCH without falling back to multipart', async () => {
+      startUpload.mockImplementation((options) => options.onError?.(uploadError('PATCH', 404)));
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([]);
+      expect(fetchMocker).not.toHaveBeenCalled();
+    });
+
+    it('fails when completion does not provide an asset ID', async () => {
+      startUpload.mockImplementation((options) => options.onSuccess?.({ lastResponse: response() }));
+
+      await expect(uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true })).resolves.toEqual([]);
+      expect(fetchMocker).not.toHaveBeenCalled();
     });
   });
 

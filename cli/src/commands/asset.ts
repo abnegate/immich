@@ -16,15 +16,15 @@ import { Matcher, watch as watchFs } from 'chokidar';
 import { MultiBar, Presets, SingleBar } from 'cli-progress';
 import { chunk } from 'lodash-es';
 import micromatch from 'micromatch';
-import { Stats, createReadStream } from 'node:fs';
+import { createReadStream, type ReadStream, type Stats } from 'node:fs';
 import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path, { basename, join } from 'node:path';
+import { Readable } from 'node:stream';
 import { Queue } from 'src/queue';
 import { BaseOptions, Batcher, authenticate, crawl, sha1 } from 'src/utils';
 import * as tus from 'tus-js-client';
 
-// File-based URL storage for TUS resume support
 class FileUrlStorage implements tus.UrlStorage {
   private cacheDir: string;
 
@@ -37,7 +37,6 @@ class FileUrlStorage implements tus.UrlStorage {
   }
 
   private getFilePath(fingerprint: string): string {
-    // Use a hash of the fingerprint to avoid filesystem issues with special characters
     const safeFingerprint = Buffer.from(fingerprint).toString('base64url');
     return join(this.cacheDir, `${safeFingerprint}.json`);
   }
@@ -50,9 +49,9 @@ class FileUrlStorage implements tus.UrlStorage {
     try {
       await this.ensureDir();
       const filePath = this.getFilePath(fingerprint);
-      const data = await readFile(filePath, 'utf-8');
+      const data = await readFile(filePath, 'utf8');
       const upload = JSON.parse(data) as tus.PreviousUpload;
-      return [upload];
+      return [{ ...upload, urlStorageKey: fingerprint }];
     } catch {
       return [];
     }
@@ -68,10 +67,15 @@ class FileUrlStorage implements tus.UrlStorage {
   }
 
   async addUpload(fingerprint: string, upload: tus.PreviousUpload): Promise<string> {
-    await this.ensureDir();
-    const filePath = this.getFilePath(fingerprint);
-    await writeFile(filePath, JSON.stringify(upload));
-    return fingerprint;
+    try {
+      await this.ensureDir();
+      const filePath = this.getFilePath(fingerprint);
+      await writeFile(filePath, JSON.stringify(upload));
+      return fingerprint;
+    } catch {
+      // tus accepts an empty storage key when no resume entry was saved.
+      return '';
+    }
   }
 }
 
@@ -86,8 +90,7 @@ const s = (count: number) => (count === 1 ? '' : 's');
 type AssetBulkUploadCheckResults = Array<AssetBulkUploadCheckResult & { id: string }>;
 type Asset = { id: string; filepath: string };
 
-// Files larger than 50MB use TUS resumable uploads
-const RESUMABLE_UPLOAD_THRESHOLD = 50 * 1024 * 1024;
+const RESUMABLE_CHUNK_SIZE = 50 * 1024 * 1024;
 
 export interface UploadOptionsDto {
   recursive?: boolean;
@@ -107,50 +110,32 @@ export interface UploadOptionsDto {
 }
 
 class UploadFile extends File {
-  private activeStream: NodeJS.ReadableStream | null = null;
+  private activeStream?: ReadStream;
 
   constructor(
-    private filepath: string,
-    private _size: number,
+    private readonly filepath: string,
+    private readonly length: number,
   ) {
     super([], basename(filepath));
   }
 
-  get size() {
-    return this._size;
+  override get size(): number {
+    return this.length;
   }
 
-  stream() {
-    if (this.activeStream) {
-      if (typeof (this.activeStream as any).destroy === 'function') {
-        (this.activeStream as any).destroy();
-      }
-    }
-
+  override stream(): ReturnType<File['stream']> {
+    this.activeStream?.destroy();
     const stream = createReadStream(this.filepath);
-    this.activeStream = stream as any;
+    this.activeStream = stream;
 
-    stream.on('close', () => {
+    stream.once('close', () => {
       if (this.activeStream === stream) {
-        this.activeStream = null;
-      }
-    });
-    stream.on('error', () => {
-      if (this.activeStream === stream) {
-        this.activeStream = null;
+        this.activeStream = undefined;
       }
     });
 
-    return stream as any;
-  }
-
-  cleanup() {
-    if (this.activeStream) {
-      if (typeof (this.activeStream as any).destroy === 'function') {
-        (this.activeStream as any).destroy();
-      }
-      this.activeStream = null;
-    }
+    // Node and DOM declarations describe the same runtime web stream differently.
+    return Readable.toWeb(stream) as ReturnType<File['stream']>;
   }
 }
 
@@ -476,7 +461,7 @@ const uploadFileResumable = async (
   input: string,
   stats: Stats,
   onProgress?: (bytesUploaded: number) => void,
-): Promise<AssetMediaResponseDto> => {
+): Promise<AssetMediaResponseDto | void> => {
   const { baseUrl, headers } = defaults;
 
   const sidecarPath = await getSidecarPath(input);
@@ -488,71 +473,71 @@ const uploadFileResumable = async (
 
   const deviceAssetId = `${basename(input)}-${stats.size}`.replaceAll(/\s+/g, '');
 
-  return new Promise((resolve, reject) => {
-    // Create a readable stream for tus-js-client in Node.js
-    const fileStream = createReadStream(input);
+  const file = createReadStream(input);
+  try {
+    return await new Promise<AssetMediaResponseDto | void>((resolve, reject) => {
+      let hasUploadUrl = false;
+      const upload = new tus.Upload(file, {
+        endpoint: `${baseUrl}/upload`,
+        headers: headers as Record<string, string>,
+        uploadSize: stats.size,
+        chunkSize: RESUMABLE_CHUNK_SIZE,
+        metadata: {
+          filename: basename(input),
+          filetype: '',
+          deviceAssetId,
+          deviceId: 'CLI',
+          fileCreatedAt: stats.mtime.toISOString(),
+          fileModifiedAt: stats.mtime.toISOString(),
+          isFavorite: 'false',
+          ...(sidecarData && { sidecarData }),
+        },
+        storeFingerprintForResuming: true,
+        urlStorage,
+        removeFingerprintOnSuccess: true,
+        onUploadUrlAvailable: () => {
+          hasUploadUrl = true;
+        },
+        onError: (error) => {
+          if (!hasUploadUrl && error instanceof tus.DetailedError && error.originalRequest?.getMethod() === 'POST') {
+            const status = error.originalResponse?.getStatus();
+            if (status === 404 || status === 405) {
+              resolve();
+              return;
+            }
+          }
 
-    // Store response headers from the final request
-    let lastAssetId: string | undefined;
-    let lastIsDuplicate = false;
+          reject(error);
+        },
+        onProgress,
+        onSuccess: ({ lastResponse }) => {
+          const id = lastResponse.getHeader('X-Immich-Asset-Id');
+          if (!id) {
+            reject(new Error('Resumable upload response did not include an asset ID'));
+            return;
+          }
 
-    const upload = new tus.Upload(fileStream as any, {
-      endpoint: `${baseUrl}/upload`,
-      headers: headers as Record<string, string>,
-      uploadSize: stats.size,
-      chunkSize: 50 * 1024 * 1024, // 50MB chunks
-      metadata: {
-        filename: basename(input),
-        filetype: '',
-        deviceAssetId,
-        deviceId: 'CLI',
-        fileCreatedAt: stats.mtime.toISOString(),
-        fileModifiedAt: stats.mtime.toISOString(),
-        isFavorite: 'false',
-        ...(sidecarData && { sidecarData }),
-      },
-      // Enable resume support
-      storeFingerprintForResuming: true,
-      urlStorage,
-      removeFingerprintOnSuccess: true,
-      onError: (error) => {
-        fileStream.destroy();
-        reject(error);
-      },
-      onProgress: (bytesUploaded) => {
-        onProgress?.(bytesUploaded);
-      },
-      onAfterResponse: (_req, res) => {
-        // Capture asset ID and duplicate status from response headers
-        const assetId = res.getHeader('x-immich-asset-id');
-        const isDuplicate = res.getHeader('x-immich-duplicate');
-        if (assetId) {
-          lastAssetId = assetId;
-          lastIsDuplicate = isDuplicate?.toLowerCase() === 'true';
-        }
-      },
-      onSuccess: () => {
-        fileStream.destroy();
+          const duplicate = lastResponse.getHeader('X-Immich-Duplicate')?.toLowerCase() === 'true';
+          resolve({ id, status: duplicate ? AssetMediaStatus.Duplicate : AssetMediaStatus.Created });
+        },
+      });
 
-        if (lastAssetId) {
-          resolve({
-            id: lastAssetId,
-            status: lastIsDuplicate ? AssetMediaStatus.Duplicate : AssetMediaStatus.Created,
-          });
-        } else {
-          reject(new Error('Asset ID not found in upload response headers. Server may not have returned X-Immich-Asset-Id header.'));
-        }
-      },
+      file.once('error', reject);
+      void upload
+        .findPreviousUploads()
+        .catch(() => [])
+        .then(([previous]) => {
+          if (previous?.uploadUrl) {
+            hasUploadUrl = true;
+            upload.resumeFromPreviousUpload(previous);
+          }
+          upload.start();
+        })
+        .catch(reject);
     });
-
-    // Check for previous uploads and resume if found
-    upload.findPreviousUploads().then((previousUploads) => {
-      if (previousUploads.length > 0) {
-        upload.resumeFromPreviousUpload(previousUploads[0]);
-      }
-      upload.start();
-    });
-  });
+  } finally {
+    file.destroy();
+  }
 };
 
 const uploadFileFormData = async (input: string, stats: Stats): Promise<AssetMediaResponseDto> => {
@@ -596,10 +581,11 @@ const uploadFile = async (
   stats: Stats,
   options: { resumable?: boolean; onProgress?: (bytesUploaded: number) => void } = {},
 ): Promise<AssetMediaResponseDto> => {
-  const useResumable = options.resumable && stats.size >= RESUMABLE_UPLOAD_THRESHOLD;
-
-  if (useResumable) {
-    return uploadFileResumable(input, stats, options.onProgress);
+  if (options.resumable && stats.size >= RESUMABLE_CHUNK_SIZE) {
+    const response = await uploadFileResumable(input, stats, options.onProgress);
+    if (response) {
+      return response;
+    }
   }
 
   return uploadFileFormData(input, stats);

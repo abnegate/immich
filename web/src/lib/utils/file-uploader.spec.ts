@@ -1,55 +1,62 @@
+import { authManager } from '$lib/managers/auth-manager.svelte';
 import { uploadAssetsStore } from '$lib/stores/upload';
+import { UploadState } from '$lib/types';
+import { uploadRequest } from '$lib/utils';
+import { addAssetsToAlbum } from '$lib/utils/asset-utils';
 import { AssetVisibility } from '@immich/sdk';
 import { get } from 'svelte/store';
+import { DetailedError, type HttpResponse, type PreviousUpload, type Upload } from 'tus-js-client';
 import { cancelUpload, fileUploadHandler, uploadExecutionQueue } from './file-uploader';
 
-// Hoisted values for use in mock factories
-const { tusUploadCalls, tusInstances, createMockUpload, setFindPreviousUploadsResult } = vi.hoisted(() => {
-  const calls: Array<{ file: File; options: any }> = [];
-  const instances: Array<any> = [];
-  let previousUploadsResult: any[] = [];
+type UploadOptions = ConstructorParameters<typeof Upload>[1];
 
-  return {
-    tusUploadCalls: calls,
-    tusInstances: instances,
-    setFindPreviousUploadsResult: (result: any[]) => {
-      previousUploadsResult = result;
-    },
-    createMockUpload: (file: File, options: any) => {
-      const instance = {
-        start: vi.fn().mockImplementation(() => {
-          // Simulate successful upload after a tick
-          setTimeout(() => {
-            if (options.onSuccess) {
-              options.onSuccess();
-            }
-          }, 0);
-        }),
-        abort: vi.fn(),
-        findPreviousUploads: vi.fn().mockImplementation(() => {
-          const result = previousUploadsResult;
-          previousUploadsResult = []; // Reset after use
-          return Promise.resolve(result);
-        }),
-        resumeFromPreviousUpload: vi.fn(),
-        url: 'http://localhost/upload/test-upload-id',
-        _xhr: {
-          getResponseHeader: vi.fn().mockReturnValue('test-asset-id'),
-        },
-      };
-      calls.push({ file, options });
-      instances.push(instance);
-      return instance;
-    },
-  };
-});
-
-// Mock tus-js-client
-vi.mock('tus-js-client', () => ({
-  Upload: vi.fn().mockImplementation((file, options) => createMockUpload(file, options)),
+const { tusUploadCalls, tusInstances, startUpload, findPreviousUploads } = vi.hoisted(() => ({
+  tusUploadCalls: [] as Array<{ file: File; options: UploadOptions }>,
+  tusInstances: [] as Array<{
+    start: ReturnType<typeof vi.fn>;
+    abort: ReturnType<typeof vi.fn>;
+    resumeFromPreviousUpload: ReturnType<typeof vi.fn>;
+  }>,
+  startUpload: vi.fn<(options: UploadOptions) => void>(),
+  findPreviousUploads: vi.fn<() => Promise<PreviousUpload[]>>(),
 }));
 
-// Mock @immich/sdk
+vi.mock('tus-js-client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('tus-js-client')>()),
+  Upload: vi.fn().mockImplementation((file: File, options: UploadOptions) => {
+    const instance = {
+      options,
+      start: vi.fn(() => startUpload(options)),
+      abort: vi.fn().mockResolvedValue(undefined),
+      findPreviousUploads,
+      resumeFromPreviousUpload: vi.fn(),
+      url: 'http://localhost/upload/test-upload-id',
+    };
+    tusUploadCalls.push({ file, options });
+    tusInstances.push(instance);
+    return instance;
+  }),
+}));
+
+const response = (headers: Record<string, string> = {}, status = 200): HttpResponse => ({
+  getHeader: (header) => headers[header.toLowerCase()],
+  getStatus: () => status,
+  getBody: () => '',
+  getUnderlyingObject: () => undefined,
+});
+
+const uploadError = (method: string, status: number): DetailedError =>
+  Object.assign(new DetailedError('Upload failed'), {
+    originalRequest: { getMethod: () => method },
+    originalResponse: response({}, status),
+  });
+
+const largeVideo = (): File => {
+  const file = new File([], 'large.mp4', { type: 'video/mp4' });
+  Object.defineProperty(file, 'size', { value: 120 * 1024 * 1024 });
+  return file;
+};
+
 vi.mock('@immich/sdk', async () => {
   const actual = await vi.importActual('@immich/sdk');
   return {
@@ -143,6 +150,13 @@ vi.mock('$lib/utils/shared-links', () => ({
 describe('file-uploader', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    authManager.isSharedLink = false;
+    startUpload
+      .mockReset()
+      .mockImplementation((options) =>
+        options.onSuccess?.({ lastResponse: response({ 'x-immich-asset-id': 'test-asset-id' }) }),
+      );
+    findPreviousUploads.mockReset().mockResolvedValue([]);
     tusUploadCalls.length = 0;
     tusInstances.length = 0;
     // Reset upload store
@@ -172,15 +186,17 @@ describe('file-uploader', () => {
       const jpgFile = new File(['test'], 'test.jpg', { type: 'image/jpeg' });
       const txtFile = new File(['test'], 'test.txt', { type: 'text/plain' });
 
-      fileUploadHandler({ files: [jpgFile, txtFile] });
+      void fileUploadHandler({ files: [jpgFile, txtFile] });
 
-      await vi.waitFor(
-        () => {
-          const items = get(uploadAssetsStore);
-          return items.length > 0;
-        },
-        { timeout: 1000 },
-      ).catch(() => {});
+      await vi
+        .waitFor(
+          () => {
+            const items = get(uploadAssetsStore);
+            return items.length > 0;
+          },
+          { timeout: 1000 },
+        )
+        .catch(() => {});
 
       const items = get(uploadAssetsStore);
       const txtItem = items.find((item) => item.file?.name === 'test.txt');
@@ -190,15 +206,17 @@ describe('file-uploader', () => {
     it('should add files to upload store', async () => {
       const file = new File(['test'], 'test.jpg', { type: 'image/jpeg' });
 
-      fileUploadHandler({ files: [file] });
+      void fileUploadHandler({ files: [file] });
 
-      await vi.waitFor(
-        () => {
-          const items = get(uploadAssetsStore);
-          return items.length > 0;
-        },
-        { timeout: 1000 },
-      ).catch(() => {});
+      await vi
+        .waitFor(
+          () => {
+            const items = get(uploadAssetsStore);
+            return items.length > 0;
+          },
+          { timeout: 1000 },
+        )
+        .catch(() => {});
 
       const items = get(uploadAssetsStore);
       expect(items.length).toBeGreaterThanOrEqual(1);
@@ -206,17 +224,19 @@ describe('file-uploader', () => {
 
     it('should generate correct device asset id', async () => {
       const file = new File(['test'], 'test.jpg', { type: 'image/jpeg' });
-      Object.defineProperty(file, 'lastModified', { value: 1234567890 });
+      Object.defineProperty(file, 'lastModified', { value: 1_234_567_890 });
 
-      fileUploadHandler({ files: [file] });
+      void fileUploadHandler({ files: [file] });
 
-      await vi.waitFor(
-        () => {
-          const items = get(uploadAssetsStore);
-          return items.length > 0;
-        },
-        { timeout: 1000 },
-      ).catch(() => {});
+      await vi
+        .waitFor(
+          () => {
+            const items = get(uploadAssetsStore);
+            return items.length > 0;
+          },
+          { timeout: 1000 },
+        )
+        .catch(() => {});
 
       const items = get(uploadAssetsStore);
       const item = items.find((i) => i.file?.name === 'test.jpg');
@@ -226,15 +246,17 @@ describe('file-uploader', () => {
     it('should pass albumId to upload item', async () => {
       const file = new File(['test'], 'test.jpg', { type: 'image/jpeg' });
 
-      fileUploadHandler({ files: [file], albumId: 'test-album-id' });
+      void fileUploadHandler({ files: [file], albumId: 'test-album-id' });
 
-      await vi.waitFor(
-        () => {
-          const items = get(uploadAssetsStore);
-          return items.length > 0;
-        },
-        { timeout: 1000 },
-      ).catch(() => {});
+      await vi
+        .waitFor(
+          () => {
+            const items = get(uploadAssetsStore);
+            return items.length > 0;
+          },
+          { timeout: 1000 },
+        )
+        .catch(() => {});
 
       const items = get(uploadAssetsStore);
       const item = items.find((i) => i.file?.name === 'test.jpg');
@@ -245,6 +267,27 @@ describe('file-uploader', () => {
   describe('cancelUpload', () => {
     it('should handle cancelling non-existent upload gracefully', () => {
       expect(() => cancelUpload('non-existent-id')).not.toThrow();
+    });
+
+    it('settles the upload and does not start it if canceled during resume lookup', async () => {
+      let resolvePrevious: (uploads: PreviousUpload[]) => void;
+      const previous = new Promise<PreviousUpload[]>((resolve) => {
+        resolvePrevious = resolve;
+      });
+      findPreviousUploads.mockReturnValueOnce(previous);
+      const file = largeVideo();
+      const upload = fileUploadHandler({ files: [file] });
+      await vi.waitFor(() => expect(findPreviousUploads).toHaveBeenCalledOnce());
+
+      const id = `web-${file.name}-${file.lastModified}`;
+      cancelUpload(id);
+      resolvePrevious!([]);
+
+      await expect(upload).resolves.toEqual([]);
+      expect(tusInstances[0].abort).toHaveBeenCalledOnce();
+      expect(tusInstances[0].start).not.toHaveBeenCalled();
+      expect(get(uploadAssetsStore)).toEqual([]);
+      expect(uploadRequest).not.toHaveBeenCalled();
     });
   });
 
@@ -262,7 +305,7 @@ describe('file-uploader', () => {
 
     it('should set correct tus metadata', async () => {
       const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
-      Object.defineProperty(largeFile, 'lastModified', { value: 1234567890 });
+      Object.defineProperty(largeFile, 'lastModified', { value: 1_234_567_890 });
 
       await fileUploadHandler({ files: [largeFile] });
 
@@ -282,7 +325,7 @@ describe('file-uploader', () => {
 
       expect(tusUploadCalls.length).toBeGreaterThan(0);
       const { options } = tusUploadCalls[0];
-      expect(options.metadata.visibility).toBe(AssetVisibility.Locked);
+      expect(options.metadata?.visibility).toBe(AssetVisibility.Locked);
     });
 
     it('should use 50MB chunk size', async () => {
@@ -312,12 +355,19 @@ describe('file-uploader', () => {
       await fileUploadHandler({ files: [largeFile] });
 
       expect(tusInstances.length).toBeGreaterThan(0);
-      expect(tusInstances[0].findPreviousUploads).toHaveBeenCalled();
+      expect(findPreviousUploads).toHaveBeenCalled();
     });
 
     it('should resume from previous upload if available', async () => {
-      const previousUpload = { uploadUrl: 'http://localhost/upload/previous-id' };
-      setFindPreviousUploadsResult([previousUpload]);
+      const previousUpload: PreviousUpload = {
+        uploadUrl: 'http://localhost/upload/previous-id',
+        metadata: {},
+        size: 50 * 1024 * 1024 + 1,
+        creationTime: '',
+        urlStorageKey: 'previous',
+        parallelUploadUrls: null,
+      };
+      findPreviousUploads.mockResolvedValueOnce([previousUpload]);
 
       const largeFile = new File(['x'.repeat(50 * 1024 * 1024 + 1)], 'large.jpg', { type: 'image/jpeg' });
 
@@ -334,6 +384,70 @@ describe('file-uploader', () => {
 
       expect(tusInstances.length).toBeGreaterThan(0);
       expect(tusInstances[0].start).toHaveBeenCalled();
+    });
+
+    it('does not resume an unlocked transfer for a locked asset', async () => {
+      findPreviousUploads.mockResolvedValueOnce([
+        {
+          uploadUrl: 'http://localhost/upload/unlocked',
+          metadata: {},
+          size: 120 * 1024 * 1024,
+          creationTime: '',
+          urlStorageKey: 'previous',
+          parallelUploadUrls: null,
+        },
+      ]);
+
+      await expect(fileUploadHandler({ files: [largeVideo()], isLockedAssets: true })).resolves.toEqual([
+        'test-asset-id',
+      ]);
+      expect(tusInstances[0].resumeFromPreviousUpload).not.toHaveBeenCalled();
+      expect(tusInstances[0].start).toHaveBeenCalledOnce();
+    });
+
+    it('uses the canonical asset ID from the completed response for albums and duplicate status', async () => {
+      startUpload.mockImplementationOnce((options) =>
+        options.onSuccess?.({
+          lastResponse: response({ 'x-immich-asset-id': 'canonical-id', 'x-immich-duplicate': 'true' }),
+        }),
+      );
+
+      await expect(fileUploadHandler({ files: [largeVideo()], albumId: 'album-id' })).resolves.toEqual([
+        'canonical-id',
+      ]);
+      expect(addAssetsToAlbum).toHaveBeenCalledWith('album-id', ['canonical-id'], false);
+      expect(get(uploadAssetsStore)[0]).toMatchObject({ assetId: 'canonical-id', state: UploadState.DUPLICATED });
+    });
+
+    it('fails when completion does not provide an asset ID', async () => {
+      startUpload.mockImplementationOnce((options) => options.onSuccess?.({ lastResponse: response() }));
+
+      await expect(fileUploadHandler({ files: [largeVideo()], albumId: 'album-id' })).resolves.toEqual([]);
+      expect(addAssetsToAlbum).not.toHaveBeenCalled();
+      expect(get(uploadAssetsStore)[0].state).toBe(UploadState.ERROR);
+      expect(uploadRequest).not.toHaveBeenCalled();
+    });
+
+    it('uses multipart when the server has no tus creation endpoint', async () => {
+      startUpload.mockImplementationOnce((options) => options.onError?.(uploadError('POST', 404)));
+
+      await expect(fileUploadHandler({ files: [largeVideo()] })).resolves.toEqual(['test-asset-id']);
+      expect(uploadRequest).toHaveBeenCalledOnce();
+    });
+
+    it('reports a failed PATCH without falling back to multipart', async () => {
+      startUpload.mockImplementationOnce((options) => options.onError?.(uploadError('PATCH', 404)));
+
+      await expect(fileUploadHandler({ files: [largeVideo()] })).resolves.toEqual([]);
+      expect(uploadRequest).not.toHaveBeenCalled();
+    });
+
+    it('uses multipart for a large shared-link upload', async () => {
+      authManager.isSharedLink = true;
+
+      await expect(fileUploadHandler({ files: [largeVideo()] })).resolves.toEqual(['test-asset-id']);
+      expect(tusUploadCalls).toHaveLength(0);
+      expect(uploadRequest).toHaveBeenCalledOnce();
     });
   });
 
@@ -370,15 +484,17 @@ describe('file-uploader', () => {
     it('should add item to store with PENDING state initially', async () => {
       const file = new File(['test'], 'test.jpg', { type: 'image/jpeg' });
 
-      fileUploadHandler({ files: [file] });
+      void fileUploadHandler({ files: [file] });
 
-      await vi.waitFor(
-        () => {
-          const items = get(uploadAssetsStore);
-          return items.length > 0;
-        },
-        { timeout: 1000 },
-      ).catch(() => {});
+      await vi
+        .waitFor(
+          () => {
+            const items = get(uploadAssetsStore);
+            return items.length > 0;
+          },
+          { timeout: 1000 },
+        )
+        .catch(() => {});
 
       const items = get(uploadAssetsStore);
       expect(items.length).toBeGreaterThan(0);
