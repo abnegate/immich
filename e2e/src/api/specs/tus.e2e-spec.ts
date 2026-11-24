@@ -13,7 +13,7 @@ import { makeRandomImage } from 'src/generators';
 import { errorDto } from 'src/responses';
 import { app, testAssetDir, utils } from 'src/utils';
 import request from 'supertest';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 // Standard chunk size used by clients (50MB)
 const CHUNK_SIZE = 50 * 1024 * 1024;
@@ -51,7 +51,7 @@ const createTusUpload = async (
     ...options.metadata,
   };
 
-  const uploadLength = options.size || makeRandomImage().length;
+  const uploadLength = options.size ?? makeRandomImage().length;
 
   return request(app)
     .post('/upload')
