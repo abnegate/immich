@@ -522,6 +522,24 @@ describe(AssetMediaService.name, () => {
       );
     });
 
+    it.each([
+      ['/upload/video-id', 'video/mp4'],
+      ['/upload/video-id.webm', 'video/webm'],
+    ])('should select the media type for %s', async (originalPath, contentType) => {
+      const asset = { ...assetStub.video, originalPath, originalFileName: 'original.mp4' };
+      mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+      mocks.asset.getById.mockResolvedValue(asset);
+
+      await expect(sut.downloadOriginal(authStub.admin, asset.id, {})).resolves.toEqual(
+        new ImmichFileResponse({
+          path: asset.originalPath,
+          fileName: asset.originalFileName,
+          contentType,
+          cacheControl: CacheControl.PrivateWithCache,
+        }),
+      );
+    });
+
     it('should download edited file by default when edits exist', async () => {
       const editedAsset = {
         ...assetStub.withCropEdit,
@@ -766,6 +784,20 @@ describe(AssetMediaService.name, () => {
           path: assetStub.video.originalPath,
           cacheControl: CacheControl.PrivateWithCache,
           contentType: 'application/octet-stream',
+        }),
+      );
+    });
+
+    it('should play an extensionless original as the original filename media type', async () => {
+      const asset = { ...assetStub.video, originalPath: '/upload/video-id', originalFileName: 'original.mp4' };
+      mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+      mocks.asset.getById.mockResolvedValue(asset);
+
+      await expect(sut.playbackVideo(authStub.admin, asset.id)).resolves.toEqual(
+        new ImmichFileResponse({
+          path: asset.originalPath,
+          contentType: 'video/mp4',
+          cacheControl: CacheControl.PrivateWithCache,
         }),
       );
     });

@@ -652,6 +652,24 @@ describe(StorageTemplateService.name, () => {
   });
 
   describe('file rename correctness', () => {
+    it('should use the original filename extension when the storage path has none', async () => {
+      const asset = assetStub.storageAsset({
+        originalPath: '/data/upload/user-id/vi/de/video-id',
+        originalFileName: 'video-original.MP4',
+      });
+      mocks.user.get.mockResolvedValue(userStub.user1);
+      mocks.assetJob.getForStorageTemplateJob.mockResolvedValue(asset);
+
+      await expect(sut.handleMigrationSingle({ id: asset.id })).resolves.toBe(JobStatus.Success);
+
+      expect(mocks.move.create).toHaveBeenCalledWith({
+        entityId: asset.id,
+        oldPath: asset.originalPath,
+        newPath: expect.stringMatching(/\/video-original\.mp4$/),
+        pathType: AssetPathType.Original,
+      });
+    });
+
     it('should not create double extensions when filename has lower extension', async () => {
       const user = factory.userAdmin({ storageLabel: 'label-1' });
       const asset = assetStub.storageAsset({

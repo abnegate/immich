@@ -217,7 +217,7 @@ export class AssetMediaService extends BaseService {
     return new ImmichFileResponse({
       path: asset.originalPath,
       fileName: asset.originalFileName,
-      contentType: mimeTypes.lookup(asset.originalPath),
+      contentType: mimeTypes.lookup(this.getOriginalMediaName(asset)),
       cacheControl: CacheControl.PrivateWithCache,
     });
   }
@@ -285,7 +285,7 @@ export class AssetMediaService extends BaseService {
 
     return new ImmichFileResponse({
       path: filepath,
-      contentType: mimeTypes.lookup(filepath),
+      contentType: mimeTypes.lookup(asset.encodedVideoPath || this.getOriginalMediaName(asset)),
       cacheControl: CacheControl.PrivateWithCache,
     });
   }
@@ -486,6 +486,13 @@ export class AssetMediaService extends BaseService {
     if (auth.user.quotaSizeInBytes !== null && auth.user.quotaSizeInBytes < auth.user.quotaUsageInBytes + size) {
       throw new BadRequestException('Quota has been exceeded!');
     }
+  }
+
+  private getOriginalMediaName({
+    originalPath,
+    originalFileName,
+  }: Pick<Asset, 'originalPath' | 'originalFileName'>): string {
+    return extname(originalPath).length > 1 ? originalPath : originalFileName;
   }
 
   private async findOrFail(id: string) {
