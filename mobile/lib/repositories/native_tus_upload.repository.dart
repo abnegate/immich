@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:cancellation_token/cancellation_token.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
@@ -10,7 +11,7 @@ import 'package:logging/logging.dart';
 
 final nativeTusUploadRepositoryProvider = Provider((ref) {
   final repository = NativeTusUploadRepository._internal();
-  ref.onDispose(() => repository.dispose());
+  ref.onDispose(repository.dispose);
   return repository;
 });
 
@@ -19,11 +20,12 @@ const int kNativeTusUploadThreshold = 50 * 1024 * 1024;
 class NativeTusUploadResult {
   final String? assetId;
   final bool isDuplicate;
+  final bool isCancelled;
   final String? error;
 
-  const NativeTusUploadResult({this.assetId, this.isDuplicate = false, this.error});
+  const NativeTusUploadResult({this.assetId, this.isDuplicate = false, this.isCancelled = false, this.error});
 
-  bool get isSuccess => assetId != null && error == null;
+  bool get isSuccess => assetId?.isNotEmpty == true && error == null;
 }
 
 class NativeTusUploadMetadata {
@@ -53,10 +55,7 @@ class _TusUploadCallbackHandler extends TusUploadCallbackApi {
   final StreamController<TusProgressUpdate> progressController;
   final StreamController<TusStatusUpdate> statusController;
 
-  _TusUploadCallbackHandler({
-    required this.progressController,
-    required this.statusController,
-  });
+  _TusUploadCallbackHandler({required this.progressController, required this.statusController});
 
   @override
   void onProgress(TusProgressUpdate update) {
@@ -77,10 +76,8 @@ class NativeTusUploadRepository {
   final Logger _logger = Logger('NativeTusUploadRepository');
   final TusUploadApi _api = TusUploadApi();
 
-  final StreamController<TusProgressUpdate> _progressController =
-      StreamController<TusProgressUpdate>.broadcast();
-  final StreamController<TusStatusUpdate> _statusController =
-      StreamController<TusStatusUpdate>.broadcast();
+  final StreamController<TusProgressUpdate> _progressController = StreamController<TusProgressUpdate>.broadcast();
+  final StreamController<TusStatusUpdate> _statusController = StreamController<TusStatusUpdate>.broadcast();
 
   Stream<TusProgressUpdate> get progressStream => _progressController.stream;
   Stream<TusStatusUpdate> get statusStream => _statusController.stream;
@@ -99,15 +96,20 @@ class NativeTusUploadRepository {
 
   void dispose() {
     TusUploadCallbackApi.setUp(null);
-    _progressController.close();
-    _statusController.close();
+    unawaited(_progressController.close());
+    unawaited(_statusController.close());
   }
 
   Future<NativeTusUploadResult> uploadFile(
     File file,
     NativeTusUploadMetadata metadata, {
     void Function(int bytesUploaded, int totalBytes)? onProgress,
+    CancellationToken? cancellationToken,
+    bool requiresWiFi = false,
   }) async {
+    const cancelled = NativeTusUploadResult(isCancelled: true, error: 'Upload cancelled');
+    if (cancellationToken?.isCancelled ?? false) return cancelled;
+
     final serverEndpoint = Store.get(StoreKey.serverEndpoint);
     final headers = ApiService.getRequestHeaders();
 
@@ -121,56 +123,71 @@ class NativeTusUploadRepository {
       fileCreatedAt: metadata.fileCreatedAt,
       fileModifiedAt: metadata.fileModifiedAt,
       isFavorite: metadata.isFavorite,
+      requiresWiFi: requiresWiFi,
       duration: metadata.duration,
       livePhotoVideoId: metadata.livePhotoVideoId,
     );
 
     StreamSubscription<TusProgressUpdate>? progressSubscription;
     StreamSubscription<TusStatusUpdate>? statusSubscription;
-    final completer = Completer<NativeTusUploadResult>();
+    final completer = CancellableCompleter<NativeTusUploadResult>(
+      cancellationToken,
+      onCancel: () => unawaited(cancelUpload(metadata.deviceAssetId)),
+    );
 
     try {
       if (onProgress != null) {
-        progressSubscription = progressStream
-            .where((update) => update.uploadId == metadata.deviceAssetId)
-            .listen((update) {
+        progressSubscription = progressStream.where((update) => update.uploadId == metadata.deviceAssetId).listen((
+          update,
+        ) {
           onProgress(update.bytesUploaded.toInt(), update.totalBytes.toInt());
         });
       }
 
-      statusSubscription = statusStream
-          .where((update) => update.uploadId == metadata.deviceAssetId)
-          .listen((update) {
+      statusSubscription = statusStream.where((update) => update.uploadId == metadata.deviceAssetId).listen((update) {
+        if (completer.isCompleted) return;
         switch (update.status) {
           case 'completed':
-            if (!completer.isCompleted) {
-              completer.complete(NativeTusUploadResult(assetId: update.assetId));
+            final assetId = update.assetId;
+            if (assetId == null || assetId.isEmpty) {
+              completer.complete(
+                const NativeTusUploadResult(error: 'The server returned no asset ID for the completed upload'),
+              );
+            } else {
+              completer.complete(NativeTusUploadResult(assetId: assetId, isDuplicate: update.isDuplicate ?? false));
             }
             break;
           case 'failed':
-            if (!completer.isCompleted) {
-              completer.complete(NativeTusUploadResult(error: update.error ?? 'Upload failed'));
-            }
+            completer.complete(NativeTusUploadResult(error: update.error ?? 'Upload failed'));
             break;
           case 'cancelled':
-            if (!completer.isCompleted) {
-              completer.complete(const NativeTusUploadResult(error: 'Upload cancelled'));
-            }
-            break;
-          default:
-            // uploading - do nothing, wait for completion
+            completer.complete(cancelled);
             break;
         }
       });
 
-      await _api.startUpload(data);
+      unawaited(
+        _api
+            .startUpload(data)
+            .then<void>(
+              (_) {},
+              onError: (Object error, StackTrace stack) {
+                if (!completer.isCompleted) completer.completeError(error, stack);
+              },
+            ),
+      );
 
-      // Resumable uploads can take a long time for large files on slow connections,
-      // but we need some upper bound to prevent hanging uploads
       return await completer.future.timeout(
         const Duration(hours: 4),
-        onTimeout: () => const NativeTusUploadResult(error: 'Upload timed out after 4 hours'),
+        onTimeout: () {
+          const result = NativeTusUploadResult(error: 'Upload timed out after 4 hours');
+          completer.complete(result);
+          unawaited(cancelUpload(metadata.deviceAssetId));
+          return result;
+        },
       );
+    } on CancelledException {
+      return cancelled;
     } catch (e) {
       _logger.severe('Native tus upload failed: $e');
       return NativeTusUploadResult(error: e.toString());

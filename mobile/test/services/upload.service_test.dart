@@ -1,14 +1,18 @@
+import 'dart:async';
 import 'dart:io';
 
+import 'package:cancellation_token/cancellation_token.dart';
 import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:immich_mobile/constants/constants.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/domain/services/store.service.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
 import 'package:immich_mobile/infrastructure/repositories/db.repository.dart';
 import 'package:immich_mobile/infrastructure/repositories/store.repository.dart';
+import 'package:immich_mobile/repositories/upload.repository.dart';
 import 'package:immich_mobile/services/app_settings.service.dart';
 import 'package:immich_mobile/services/upload.service.dart';
 import 'package:mocktail/mocktail.dart';
@@ -18,6 +22,8 @@ import '../fixtures/asset.stub.dart';
 import '../infrastructure/repository.mock.dart';
 import '../repository.mocks.dart';
 import '../mocks/asset_entity.mock.dart';
+
+class MockFile extends Mock implements File {}
 
 void main() {
   late UploadService sut;
@@ -31,6 +37,8 @@ void main() {
 
   setUpAll(() async {
     registerFallbackValue(AppSettingsEnum.useCellularForUploadPhotos);
+    registerFallbackValue(CancellationToken());
+    registerFallbackValue(<UploadTaskWithFile>[]);
 
     TestWidgetsFlutterBinding.ensureInitialized();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
@@ -70,6 +78,42 @@ void main() {
 
   tearDown(() {
     sut.dispose();
+  });
+
+  test('cancels a large foreground backup while preserving the task network policy', () async {
+    final asset = LocalAssetStub.image1;
+    final entity = MockAssetEntity();
+    final file = MockFile();
+    final forwarded = Completer<CancellationToken>();
+    final completed = Completer<void>();
+    when(() => file.path).thenReturn('/path/to/file.jpg');
+    when(file.length).thenAnswer((_) async => 101 * 1024 * 1024);
+    when(() => entity.isLivePhoto).thenReturn(false);
+    when(() => mockStorageRepository.clearCache()).thenAnswer((_) async {});
+    when(() => mockStorageRepository.getAssetEntityForAsset(asset)).thenAnswer((_) async => entity);
+    when(() => mockStorageRepository.getFileForAsset(asset.id)).thenAnswer((_) async => file);
+    when(() => mockAssetMediaRepository.getOriginalFilename(asset.id)).thenAnswer((_) async => asset.name);
+    when(() => mockBackupRepository.getCandidates('user')).thenAnswer((_) async => [asset]);
+    when(() => mockUploadRepository.reset(kBackupGroup)).thenAnswer((_) async => 0);
+    when(() => mockUploadRepository.deleteDatabaseRecords(kBackupGroup)).thenAnswer((_) async {});
+    when(() => mockUploadRepository.getActiveTasks(kBackupGroup)).thenAnswer((_) async => []);
+    when(() => mockUploadRepository.backupWithDartClient(any(), any())).thenAnswer((invocation) {
+      final task = (invocation.positionalArguments[0] as Iterable<UploadTaskWithFile>).single.task;
+      expect(task.requiresWiFi, true);
+      expect(task.group, kBackupGroup);
+      forwarded.complete(invocation.positionalArguments[1] as CancellationToken);
+      return completed.future;
+    });
+
+    final backup = sut.startBackup('user', (_) {});
+    try {
+      final token = await forwarded.future;
+      await sut.cancelBackup();
+      expect(token.isCancelled, true);
+    } finally {
+      completed.complete();
+      await backup;
+    }
   });
 
   group('getUploadTask', () {

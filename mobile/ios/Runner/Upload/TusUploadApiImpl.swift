@@ -1,15 +1,19 @@
-import Foundation
 import Flutter
+import Foundation
 import TUSKit
 
-class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin {
+class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin, URLSessionTaskDelegate {
   static let name = "TusUploadApi"
 
-  private var tusClient: TUSClient?
+  private struct Upload {
+    let deviceAssetId: String
+    let endpoint: URL
+    let client: TUSClient
+    let session: URLSession
+  }
+
   private var callbackApi: TusUploadCallbackApi?
-  private var activeUploads: [String: UUID] = [:]
-  private var uploadIdToDeviceAssetId: [UUID: String] = [:]
-  private var currentServerEndpoint: String?
+  private var uploads: [UUID: Upload] = [:]
 
   static func register(with registrar: FlutterPluginRegistrar) {
     let instance = TusUploadApiImpl()
@@ -18,97 +22,64 @@ class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin {
     registrar.publish(instance)
   }
 
-  private func getTusClient(serverEndpoint: String) throws -> TUSClient {
-    if let client = tusClient, currentServerEndpoint == serverEndpoint {
-      return client
-    }
-
-    guard let uploadURL = URL(string: "\(serverEndpoint)/upload") else {
-      throw NSError(domain: "TusUploadApiImpl", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid server endpoint"])
-    }
-
-    do {
-      let client = try TUSClient(
-        server: uploadURL,
-        sessionIdentifier: "immich-tus-session",
-        sessionConfiguration: .default,
-        storageDirectory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!.appendingPathComponent("tus-uploads"),
-        chunkSize: 50 * 1024 * 1024 // 50MB chunks for better performance
-      )
-
-      client.delegate = self
-      tusClient = client
-      currentServerEndpoint = serverEndpoint
-      return client
-    } catch {
-      tusClient = nil
-      currentServerEndpoint = nil
-      throw error
-    }
-  }
-
   func startUpload(data: TusUploadData, completion: @escaping (Result<String, Error>) -> Void) {
     do {
-      let client = try getTusClient(serverEndpoint: data.serverEndpoint)
-
-      let fileURL = URL(fileURLWithPath: data.filePath)
-
-      // Note: Do NOT Base64 encode values here - TUSKit handles encoding automatically
-      var metadata: [String: String] = [:]
-      metadata["filename"] = data.filename
-      metadata["deviceAssetId"] = data.deviceAssetId
-      metadata["deviceId"] = data.deviceId
-      metadata["fileCreatedAt"] = data.fileCreatedAt
-      metadata["fileModifiedAt"] = data.fileModifiedAt
-      metadata["isFavorite"] = String(data.isFavorite)
-
-      if let duration = data.duration {
-        metadata["duration"] = duration
-      }
-      if let livePhotoVideoId = data.livePhotoVideoId {
-        metadata["livePhotoVideoId"] = livePhotoVideoId
+      guard !uploads.values.contains(where: { $0.deviceAssetId == data.deviceAssetId }) else {
+        throw uploadError("Upload is already active")
       }
 
-      var headers: [String: String] = [:]
-      for (key, value) in data.headers {
-        headers[key] = value
+      guard let endpoint = URL(string: "\(data.serverEndpoint)/upload"),
+            let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+        throw uploadError("Invalid upload endpoint or cache directory")
       }
 
-      let uploadId = try client.uploadFileAt(
-        filePath: fileURL,
-        customHeaders: headers,
-        context: metadata
+      // TUSKit persists per-upload custom headers along with the resume metadata.
+      let configuration = URLSessionConfiguration.ephemeral
+      configuration.httpAdditionalHeaders = data.headers.filter {
+        $0.key.caseInsensitiveCompare("Tus-Resumable") != .orderedSame
+      }
+      configuration.allowsCellularAccess = !data.requiresWiFi
+      configuration.allowsExpensiveNetworkAccess = !data.requiresWiFi
+      configuration.waitsForConnectivity = true
+
+      let client = try TUSClient(
+        server: endpoint,
+        sessionIdentifier: "immich-tus-session",
+        sessionConfiguration: configuration,
+        storageDirectory: cache.appendingPathComponent("tus-uploads"),
+        chunkSize: 50 * 1024 * 1024
       )
+      client.delegate = self
 
-      activeUploads[data.deviceAssetId] = uploadId
-      uploadIdToDeviceAssetId[uploadId] = data.deviceAssetId
+      var metadata = [
+        "filename": data.filename,
+        "deviceAssetId": data.deviceAssetId,
+        "deviceId": data.deviceId,
+        "fileCreatedAt": data.fileCreatedAt,
+        "fileModifiedAt": data.fileModifiedAt,
+        "isFavorite": String(data.isFavorite),
+      ]
+      metadata["duration"] = data.duration
+      metadata["livePhotoVideoId"] = data.livePhotoVideoId
 
-      callbackApi?.onStatusChange(
-        update: TusStatusUpdate(
-          uploadId: data.deviceAssetId,
-          status: "uploading",
-          assetId: nil,
-          error: nil
-        )
-      ) { _ in }
-
+      let id = try client.uploadFileAt(filePath: URL(fileURLWithPath: data.filePath), context: metadata)
+      let session = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
+      uploads[id] = Upload(deviceAssetId: data.deviceAssetId, endpoint: endpoint, client: client, session: session)
       completion(.success(data.deviceAssetId))
-
     } catch {
       completion(.failure(error))
     }
   }
 
   func cancelUpload(uploadId: String, completion: @escaping (Result<Bool, Error>) -> Void) {
-    guard let tusUploadId = activeUploads[uploadId] else {
+    guard let (id, upload) = uploads.first(where: { $0.value.deviceAssetId == uploadId }) else {
       completion(.success(false))
       return
     }
 
     do {
-      try tusClient?.cancel(id: tusUploadId)
-      activeUploads.removeValue(forKey: uploadId)
-      uploadIdToDeviceAssetId.removeValue(forKey: tusUploadId)
+      try upload.client.cancel(id: id)
+      finish(id: id, status: "cancelled")
       completion(.success(true))
     } catch {
       completion(.failure(error))
@@ -116,114 +87,104 @@ class TusUploadApiImpl: NSObject, TusUploadApi, FlutterPlugin {
   }
 
   func cancelAllUploads(completion: @escaping (Result<Void, Error>) -> Void) {
-    tusClient?.stopAndCancelAll()
-    activeUploads.removeAll()
-    uploadIdToDeviceAssetId.removeAll()
+    for (id, upload) in Array(uploads) {
+      upload.client.stopAndCancelAll()
+      finish(id: id, status: "cancelled")
+    }
     completion(.success(()))
   }
 
   func getUploadOffset(uploadId: String, completion: @escaping (Result<Int64?, Error>) -> Void) {
-    // TUSKit doesn't expose offset directly, return nil
     completion(.success(nil))
   }
 
   func getPendingUploadIds(completion: @escaping (Result<[String], Error>) -> Void) {
-    completion(.success(Array(activeUploads.keys)))
+    completion(.success(uploads.values.map(\.deviceAssetId)))
   }
 
-  private func fetchAssetIdFromServer(uploadURL: URL) async -> String? {
-    var request = URLRequest(url: uploadURL)
-    request.httpMethod = "HEAD"
-    request.setValue("1.0.0", forHTTPHeaderField: "Tus-Resumable")
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    completionHandler(nil)
+  }
 
-    do {
-      let (_, response) = try await URLSession.shared.data(for: request)
-      if let httpResponse = response as? HTTPURLResponse {
-        return httpResponse.value(forHTTPHeaderField: "X-Immich-Asset-Id")
-      }
-    } catch {
-      NSLog("Failed to fetch asset ID from server: \(error)")
-    }
+  private func uploadError(_ message: String) -> NSError {
+    NSError(domain: Self.name, code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+  }
 
-    return nil
+  private func isSameOrigin(_ url: URL, as endpoint: URL) -> Bool {
+    url.scheme == endpoint.scheme && url.host == endpoint.host &&
+      (url.port ?? (url.scheme == "https" ? 443 : 80)) ==
+      (endpoint.port ?? (endpoint.scheme == "https" ? 443 : 80))
+  }
+
+  private func finish(id: UUID, status: String, assetId: String? = nil, isDuplicate: Bool? = nil, error: String? = nil) {
+    guard let upload = uploads.removeValue(forKey: id) else { return }
+    upload.session.invalidateAndCancel()
+    callbackApi?.onStatusChange(
+      update: TusStatusUpdate(
+        uploadId: upload.deviceAssetId,
+        status: status,
+        assetId: assetId,
+        isDuplicate: isDuplicate,
+        error: error
+      )
+    ) { _ in }
   }
 }
 
-// MARK: - TUSClientDelegate
-
 extension TusUploadApiImpl: TUSClientDelegate {
   func didStartUpload(id: UUID, context: [String: String]?, client: TUSClient) {
-    guard let deviceAssetId = uploadIdToDeviceAssetId[id] else { return }
-
-    callbackApi?.onStatusChange(
-      update: TusStatusUpdate(
-        uploadId: deviceAssetId,
-        status: "uploading",
-        assetId: nil,
-        error: nil
-      )
-    ) { _ in }
+    guard let upload = uploads[id] else { return }
+    callbackApi?.onStatusChange(update: TusStatusUpdate(uploadId: upload.deviceAssetId, status: "uploading")) { _ in }
   }
 
   func didFinishUpload(id: UUID, url: URL, context: [String: String]?, client: TUSClient) {
-    guard let deviceAssetId = uploadIdToDeviceAssetId[id] else { return }
-
-    let assetIdFromContext = context?["x-immich-asset-id"] ?? context?["X-Immich-Asset-Id"]
-
-    if let assetId = assetIdFromContext, !assetId.isEmpty {
-      completeUpload(deviceAssetId: deviceAssetId, tusId: id, assetId: assetId)
-    } else {
-      Task {
-        let assetId = await fetchAssetIdFromServer(uploadURL: url)
-        completeUpload(deviceAssetId: deviceAssetId, tusId: id, assetId: assetId)
-      }
+    guard let upload = uploads[id] else { return }
+    guard isSameOrigin(url, as: upload.endpoint) else {
+      finish(id: id, status: "failed", error: "Upload URL changed origin")
+      return
     }
-  }
 
-  private func completeUpload(deviceAssetId: String, tusId: UUID, assetId: String?) {
-    callbackApi?.onStatusChange(
-      update: TusStatusUpdate(
-        uploadId: deviceAssetId,
-        status: "completed",
-        assetId: assetId,
-        error: nil
-      )
-    ) { _ in }
-
-    activeUploads.removeValue(forKey: deviceAssetId)
-    uploadIdToDeviceAssetId.removeValue(forKey: tusId)
+    var request = URLRequest(url: url)
+    request.httpMethod = "HEAD"
+    request.setValue("1.0.0", forHTTPHeaderField: "Tus-Resumable")
+    upload.session.dataTask(with: request) { [weak self] _, response, error in
+      guard let self else { return }
+      if let error {
+        self.finish(id: id, status: "failed", error: error.localizedDescription)
+        return
+      }
+      guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode),
+            let assetId = response.value(forHTTPHeaderField: "X-Immich-Asset-Id"), !assetId.isEmpty,
+            let duplicate = response.value(forHTTPHeaderField: "X-Immich-Duplicate"),
+            let isDuplicate = Bool(duplicate) else {
+        self.finish(id: id, status: "failed", error: "The server returned no upload result")
+        return
+      }
+      self.finish(id: id, status: "completed", assetId: assetId, isDuplicate: isDuplicate)
+    }.resume()
   }
 
   func uploadFailed(id: UUID, error: Error, context: [String: String]?, client: TUSClient) {
-    guard let deviceAssetId = uploadIdToDeviceAssetId[id] else { return }
-
-    callbackApi?.onStatusChange(
-      update: TusStatusUpdate(
-        uploadId: deviceAssetId,
-        status: "failed",
-        assetId: nil,
-        error: error.localizedDescription
-      )
-    ) { _ in }
-
-    activeUploads.removeValue(forKey: deviceAssetId)
-    uploadIdToDeviceAssetId.removeValue(forKey: id)
+    finish(id: id, status: "failed", error: error.localizedDescription)
   }
 
   func fileError(error: TUSClientError, client: TUSClient) {
-    NSLog("TUS file error: \(error.localizedDescription)")
+    NSLog("TUS file error: %@", error.localizedDescription)
   }
 
-  func totalProgress(bytesUploaded: Int, totalBytes: Int, client: TUSClient) {
-    // This is global progress, not per-upload
-  }
+  func totalProgress(bytesUploaded: Int, totalBytes: Int, client: TUSClient) {}
 
   func progressFor(id: UUID, context: [String: String]?, bytesUploaded: Int, totalBytes: Int, client: TUSClient) {
-    guard let deviceAssetId = uploadIdToDeviceAssetId[id] else { return }
-
+    guard let upload = uploads[id] else { return }
     callbackApi?.onProgress(
       update: TusProgressUpdate(
-        uploadId: deviceAssetId,
+        uploadId: upload.deviceAssetId,
         bytesUploaded: Int64(bytesUploaded),
         totalBytes: Int64(totalBytes)
       )

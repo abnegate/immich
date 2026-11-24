@@ -96,6 +96,7 @@ data class TusUploadData (
   val fileCreatedAt: String,
   val fileModifiedAt: String,
   val isFavorite: Boolean,
+  val requiresWiFi: Boolean,
   val duration: String? = null,
   val livePhotoVideoId: String? = null
 )
@@ -111,9 +112,10 @@ data class TusUploadData (
       val fileCreatedAt = pigeonVar_list[6] as String
       val fileModifiedAt = pigeonVar_list[7] as String
       val isFavorite = pigeonVar_list[8] as Boolean
-      val duration = pigeonVar_list[9] as String?
-      val livePhotoVideoId = pigeonVar_list[10] as String?
-      return TusUploadData(filePath, filename, serverEndpoint, headers, deviceAssetId, deviceId, fileCreatedAt, fileModifiedAt, isFavorite, duration, livePhotoVideoId)
+      val requiresWiFi = pigeonVar_list[9] as Boolean
+      val duration = pigeonVar_list[10] as String?
+      val livePhotoVideoId = pigeonVar_list[11] as String?
+      return TusUploadData(filePath, filename, serverEndpoint, headers, deviceAssetId, deviceId, fileCreatedAt, fileModifiedAt, isFavorite, requiresWiFi, duration, livePhotoVideoId)
     }
   }
   fun toList(): List<Any?> {
@@ -127,6 +129,7 @@ data class TusUploadData (
       fileCreatedAt,
       fileModifiedAt,
       isFavorite,
+      requiresWiFi,
       duration,
       livePhotoVideoId,
     )
@@ -190,6 +193,7 @@ data class TusStatusUpdate (
   val uploadId: String,
   val status: String,
   val assetId: String? = null,
+  val isDuplicate: Boolean? = null,
   val error: String? = null
 )
  {
@@ -198,8 +202,9 @@ data class TusStatusUpdate (
       val uploadId = pigeonVar_list[0] as String
       val status = pigeonVar_list[1] as String
       val assetId = pigeonVar_list[2] as String?
-      val error = pigeonVar_list[3] as String?
-      return TusStatusUpdate(uploadId, status, assetId, error)
+      val isDuplicate = pigeonVar_list[3] as Boolean?
+      val error = pigeonVar_list[4] as String?
+      return TusStatusUpdate(uploadId, status, assetId, isDuplicate, error)
     }
   }
   fun toList(): List<Any?> {
@@ -207,6 +212,7 @@ data class TusStatusUpdate (
       uploadId,
       status,
       assetId,
+      isDuplicate,
       error,
     )
   }

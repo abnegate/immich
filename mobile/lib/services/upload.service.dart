@@ -69,6 +69,7 @@ class UploadService {
   Stream<TaskProgressUpdate> get taskProgressStream => _taskProgressController.stream;
 
   bool shouldAbortQueuingTasks = false;
+  CancellationToken? _backupCancellation;
 
   void _onTaskProgressCallback(TaskProgressUpdate update) {
     if (!_taskProgressController.isClosed) {
@@ -84,8 +85,9 @@ class UploadService {
   }
 
   void dispose() {
-    _taskStatusController.close();
-    _taskProgressController.close();
+    _backupCancellation?.cancel();
+    unawaited(_taskStatusController.close());
+    unawaited(_taskProgressController.close());
   }
 
   Future<List<bool>> enqueueTasks(List<UploadTask> tasks) {
@@ -107,23 +109,13 @@ class UploadService {
     final cancellationToken = CancellationToken();
 
     for (final asset in localAssets) {
-      final taskWithFile = await _getUploadTaskWithFile(asset);
-      if (taskWithFile == null) continue;
+      final candidate = await _getUploadTaskWithFile(asset, group: kManualUploadGroup, priority: 1);
+      if (candidate == null) continue;
 
-      final fileSize = taskWithFile.file.lengthSync();
-      if (fileSize >= kNativeTusUploadThreshold) {
-        // Large files use TUS
-        largeFileTasks.add(taskWithFile);
+      if (await candidate.file.length() >= kNativeTusUploadThreshold) {
+        largeFileTasks.add(candidate);
       } else {
-        // Small files use FileDownloader
-        final task = await getUploadTask(
-          asset,
-          group: kManualUploadGroup,
-          priority: 1,
-        );
-        if (task != null) {
-          smallFileTasks.add(task);
-        }
+        smallFileTasks.add(candidate.task);
       }
     }
 
@@ -141,62 +133,51 @@ class UploadService {
   /// Find backup candidates
   /// Build the upload tasks
   /// Enqueue the tasks
-  /// Large files (>= 10MB) use TUS protocol for resumable uploads
   Future<void> startBackup(String userId, void Function(EnqueueStatus status) onEnqueueTasks) async {
-    await _storageRepository.clearCache();
-
     shouldAbortQueuingTasks = false;
+    _backupCancellation?.cancel();
+    final cancellationToken = _backupCancellation = CancellationToken();
 
-    final candidates = await _backupRepository.getCandidates(userId);
-    if (candidates.isEmpty) {
-      return;
-    }
+    try {
+      await _storageRepository.clearCache();
+      final candidates = await _backupRepository.getCandidates(userId);
+      const batchSize = 100;
+      var count = 0;
 
-    const batchSize = 100;
-    int count = 0;
-    final cancellationToken = CancellationToken();
+      for (int i = 0; i < candidates.length; i += batchSize) {
+        if (shouldAbortQueuingTasks || cancellationToken.isCancelled) break;
 
-    for (int i = 0; i < candidates.length; i += batchSize) {
-      if (shouldAbortQueuingTasks) {
-        cancellationToken.cancel();
-        break;
-      }
+        final batch = candidates.skip(i).take(batchSize);
+        final smallFileTasks = <UploadTask>[];
+        final largeFileTasks = <UploadTaskWithFile>[];
 
-      final batch = candidates.skip(i).take(batchSize).toList();
-      List<UploadTask> smallFileTasks = [];
-      List<UploadTaskWithFile> largeFileTasks = [];
+        for (final asset in batch) {
+          final candidate = await _getUploadTaskWithFile(asset);
+          if (candidate == null) continue;
 
-      for (final asset in batch) {
-        // Check file size to determine upload method
-        final taskWithFile = await _getUploadTaskWithFile(asset);
-        if (taskWithFile == null) continue;
+          if (await candidate.file.length() >= kNativeTusUploadThreshold) {
+            largeFileTasks.add(candidate);
+          } else {
+            smallFileTasks.add(candidate.task);
+          }
+        }
 
-        final fileSize = taskWithFile.file.lengthSync();
-        if (fileSize >= kNativeTusUploadThreshold) {
-          // Large files use TUS
-          largeFileTasks.add(taskWithFile);
-        } else {
-          // Small files use FileDownloader
-          final task = await getUploadTask(asset);
-          if (task != null) {
-            smallFileTasks.add(task);
+        if (smallFileTasks.isNotEmpty && !cancellationToken.isCancelled) {
+          await enqueueTasks(smallFileTasks);
+          count += smallFileTasks.length;
+          onEnqueueTasks(EnqueueStatus(enqueueCount: count, totalCount: candidates.length));
+        }
+
+        if (largeFileTasks.isNotEmpty && !cancellationToken.isCancelled) {
+          await _uploadRepository.backupWithDartClient(largeFileTasks, cancellationToken);
+          if (!cancellationToken.isCancelled) {
+            count += largeFileTasks.length;
+            onEnqueueTasks(EnqueueStatus(enqueueCount: count, totalCount: candidates.length));
           }
         }
       }
-
-      // Upload large files via TUS first (foreground, with progress)
-      if (largeFileTasks.isNotEmpty && !shouldAbortQueuingTasks) {
-        await _uploadRepository.backupWithDartClient(largeFileTasks, cancellationToken);
-        count += largeFileTasks.length;
-        onEnqueueTasks(EnqueueStatus(enqueueCount: count, totalCount: candidates.length));
-      }
-
-      // Enqueue small files to FileDownloader (background)
-      if (smallFileTasks.isNotEmpty && !shouldAbortQueuingTasks) {
-        count += smallFileTasks.length;
-        await enqueueTasks(smallFileTasks);
-        onEnqueueTasks(EnqueueStatus(enqueueCount: count, totalCount: candidates.length));
-      }
+    } finally {
+      if (identical(_backupCancellation, cancellationToken)) _backupCancellation = null;
     }
   }
 
@@ -242,6 +223,7 @@ class UploadService {
   /// Return the number of left over tasks in the queue
   Future<int> cancelBackup() async {
     shouldAbortQueuingTasks = true;
+    _backupCancellation?.cancel();
 
     await _storageRepository.clearCache();
     await _uploadRepository.reset(kBackupGroup);
@@ -309,44 +291,16 @@ class UploadService {
     }
   }
 
-  Future<UploadTaskWithFile?> _getUploadTaskWithFile(LocalAsset asset) async {
-    final entity = await _storageRepository.getAssetEntityForAsset(asset);
-    if (entity == null) {
-      return null;
-    }
-
-    final file = await _storageRepository.getFileForAsset(asset.id);
-    if (file == null) {
-      return null;
-    }
-
-    final originalFileName = entity.isLivePhoto ? p.setExtension(asset.name, p.extension(file.path)) : asset.name;
-
-    String metadata = UploadTaskMetadata(
-      localAssetId: asset.id,
-      isLivePhotos: entity.isLivePhoto,
-      livePhotoVideoId: '',
-    ).toJson();
-
-    return UploadTaskWithFile(
-      file: file,
-      task: await buildUploadTask(
-        file,
-        createdAt: asset.createdAt,
-        modifiedAt: asset.updatedAt,
-        originalFileName: originalFileName,
-        deviceAssetId: asset.id,
-        metadata: metadata,
-        group: "group",
-        priority: 0,
-        isFavorite: asset.isFavorite,
-        requiresWiFi: false,
-      ),
-    );
-  }
-
   @visibleForTesting
   Future<UploadTask?> getUploadTask(LocalAsset asset, {String group = kBackupGroup, int? priority}) async {
+    return (await _getUploadTaskWithFile(asset, group: group, priority: priority))?.task;
+  }
+
+  Future<UploadTaskWithFile?> _getUploadTaskWithFile(
+    LocalAsset asset, {
+    String group = kBackupGroup,
+    int? priority,
+  }) async {
     final entity = await _storageRepository.getAssetEntityForAsset(asset);
     if (entity == null) {
       return null;
@@ -385,7 +339,7 @@ class UploadService {
 
     final requiresWiFi = _shouldRequireWiFi(asset);
 
-    return buildUploadTask(
+    final task = await buildUploadTask(
       file,
       createdAt: asset.createdAt,
       modifiedAt: asset.updatedAt,
@@ -397,6 +351,7 @@ class UploadService {
       isFavorite: asset.isFavorite,
       requiresWiFi: requiresWiFi,
     );
+    return UploadTaskWithFile(file: file, task: task);
   }
 
   @visibleForTesting

@@ -4,13 +4,11 @@ import 'package:pigeon/pigeon.dart';
   PigeonOptions(
     dartOut: 'lib/platform/tus_upload_api.g.dart',
     swiftOut: 'ios/Runner/Upload/TusUpload.g.swift',
-    kotlinOut:
-        'android/app/src/main/kotlin/app/alextran/immich/upload/TusUpload.g.kt',
+    kotlinOut: 'android/app/src/main/kotlin/app/alextran/immich/upload/TusUpload.g.kt',
     kotlinOptions: KotlinOptions(package: 'app.alextran.immich.upload'),
     dartPackageName: 'immich_mobile',
   ),
 )
-
 /// Metadata for tus upload
 class TusUploadData {
   const TusUploadData({
@@ -23,6 +21,7 @@ class TusUploadData {
     required this.fileCreatedAt,
     required this.fileModifiedAt,
     required this.isFavorite,
+    required this.requiresWiFi,
     this.duration,
     this.livePhotoVideoId,
   });
@@ -36,17 +35,14 @@ class TusUploadData {
   final String fileCreatedAt;
   final String fileModifiedAt;
   final bool isFavorite;
+  final bool requiresWiFi;
   final String? duration;
   final String? livePhotoVideoId;
 }
 
 /// Progress update for tus upload
 class TusProgressUpdate {
-  const TusProgressUpdate({
-    required this.uploadId,
-    required this.bytesUploaded,
-    required this.totalBytes,
-  });
+  const TusProgressUpdate({required this.uploadId, required this.bytesUploaded, required this.totalBytes});
 
   final String uploadId;
   final int bytesUploaded;
@@ -55,16 +51,12 @@ class TusProgressUpdate {
 
 /// Status update for tus upload
 class TusStatusUpdate {
-  const TusStatusUpdate({
-    required this.uploadId,
-    required this.status,
-    this.assetId,
-    this.error,
-  });
+  const TusStatusUpdate({required this.uploadId, required this.status, this.assetId, this.isDuplicate, this.error});
 
   final String uploadId;
   final String status; // 'uploading', 'completed', 'failed', 'cancelled'
   final String? assetId;
+  final bool? isDuplicate;
   final String? error;
 }
 

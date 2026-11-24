@@ -1,24 +1,43 @@
 package app.alextran.immich.upload
 
 import android.content.Context
+import app.alextran.immich.connectivity.ConnectivityApiImpl
+import app.alextran.immich.connectivity.NetworkCapability
 import app.alextran.immich.core.ImmichPlugin
 import io.flutter.embedding.engine.plugins.FlutterPlugin
-import io.flutter.plugin.common.BinaryMessenger
+import io.tus.java.client.ProtocolException
 import io.tus.java.client.TusClient
 import io.tus.java.client.TusUpload
-import io.tus.java.client.TusUploader
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
+import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 
-class TusUploadApiImpl(context: Context) : ImmichPlugin(), TusUploadApi {
+class TusUploadApiImpl(
+  context: Context,
+) : ImmichPlugin(),
+  TusUploadApi {
   companion object {
-    const val name = "TusUploadApi"
-    private const val CHUNK_SIZE = 50 * 1024 * 1024 // 50MB chunks for better performance
+    private const val BUFFER_SIZE = 2 * 1024 * 1024
+    private const val REQUEST_PAYLOAD_SIZE = 10 * 1024 * 1024
+    private const val RESPONSE_TIMEOUT_MS = 30_000
   }
 
-  private val ctx: Context = context.applicationContext
+  private val context = context.applicationContext
+  private val connectivity = ConnectivityApiImpl(this.context)
   private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
   private val activeUploads = ConcurrentHashMap<String, Job>()
   private var callbackApi: TusUploadCallbackApi? = null
@@ -37,126 +56,112 @@ class TusUploadApiImpl(context: Context) : ImmichPlugin(), TusUploadApi {
     callbackApi = null
   }
 
-  override fun startUpload(data: TusUploadData, callback: (Result<String>) -> Unit) {
+  override fun startUpload(
+    data: TusUploadData,
+    callback: (Result<String>) -> Unit,
+  ) {
     val uploadId = data.deviceAssetId
 
-    val job = scope.launch {
-      try {
-        val file = File(data.filePath)
-        if (!file.exists()) {
-          callback(Result.failure(Exception("File not found: ${data.filePath}")))
-          return@launch
-        }
+    val job =
+      scope.launch(start = CoroutineStart.LAZY) {
+        try {
+          val file = File(data.filePath)
+          check(file.isFile) { "File not found: ${data.filePath}" }
+          requireUnmeteredNetwork(data.requiresWiFi)
 
-        val client = TusClient().apply {
-          uploadCreationURL = URL("${data.serverEndpoint}/upload")
-          enableResuming(TusPreferencesURLStore(ctx, uploadId))
-        }
+          val endpoint = URL("${data.serverEndpoint}/upload")
+          val store = TusPreferencesURLStore(context, "${data.serverEndpoint}:$uploadId")
+          val client =
+            object : TusClient() {
+              override fun prepareConnection(connection: HttpURLConnection) {
+                check(
+                  connection.url.protocol == endpoint.protocol && connection.url.host == endpoint.host &&
+                    connection.url.effectivePort == endpoint.effectivePort,
+                ) { "Upload URL changed origin" }
+                super.prepareConnection(connection)
+                connection.instanceFollowRedirects = false
+                connection.readTimeout = RESPONSE_TIMEOUT_MS
+              }
+            }.apply {
+              uploadCreationURL = endpoint
+              enableResuming(store)
+              headers = data.headers.filterKeys { !it.equals("Tus-Resumable", ignoreCase = true) }
+            }
+          val upload =
+            TusUpload(file).apply {
+              metadata = buildMetadata(data)
+            }
 
-        // Note: Do NOT set Tus-Resumable here - tus-java-client sets it automatically
-        // Setting it twice results in "1.0.0, 1.0.0" which fails validation
-        client.headers = data.headers
+          reportStatus(TusStatusUpdate(uploadId = uploadId, status = "uploading"))
+          val uploader =
+            try {
+              client.resumeOrCreateUpload(upload)
+            } catch (error: ProtocolException) {
+              if (error.causingConnection?.responseCode != 410) throw error
+              store.clear()
+              client.createUpload(upload)
+            }
+          try {
+            uploader.chunkSize = BUFFER_SIZE
+            uploader.requestPayloadSize = REQUEST_PAYLOAD_SIZE
 
-        val upload = TusUpload(file).apply {
-          // Set metadata
-          metadata = buildMetadata(data)
-        }
+            while (uploader.offset < upload.size) {
+              currentCoroutineContext().ensureActive()
+              requireUnmeteredNetwork(data.requiresWiFi)
+              if (uploader.uploadChunk() <= 0) throw IOException("Upload file ended before the expected size")
 
-        withContext(Dispatchers.Main) {
-          callbackApi?.onStatusChange(
-            TusStatusUpdate(
-              uploadId = uploadId,
-              status = "uploading",
-              assetId = null,
-              error = null
-            )
-          ) {}
-        }
-
-        val uploader = client.resumeOrCreateUpload(upload)
-        uploader.chunkSize = CHUNK_SIZE
-
-        var bytesUploaded = uploader.offset
-        val totalBytes = upload.size
-
-        while (uploader.uploadChunk() > -1) {
-          val job = activeUploads[uploadId]
-          if (job == null || !job.isActive) {
+              withContext(Dispatchers.Main) {
+                callbackApi?.onProgress(TusProgressUpdate(uploadId, uploader.offset, upload.size)) {}
+              }
+            }
+          } finally {
             uploader.finish()
-            throw CancellationException("Upload cancelled")
           }
 
-          bytesUploaded = uploader.offset
-
-          withContext(Dispatchers.Main) {
-            callbackApi?.onProgress(
-              TusProgressUpdate(
-                uploadId = uploadId,
-                bytesUploaded = bytesUploaded,
-                totalBytes = totalBytes
-              )
-            ) {}
-          }
+          currentCoroutineContext().ensureActive()
+          requireUnmeteredNetwork(data.requiresWiFi)
+          val result = fetchUploadResult(client, uploader.uploadURL)
+          store.clear()
+          reportStatus(TusStatusUpdate(uploadId, "completed", result.assetId, result.isDuplicate))
+        } catch (_: CancellationException) {
+          reportStatus(TusStatusUpdate(uploadId = uploadId, status = "cancelled"))
+        } catch (error: Exception) {
+          val status = if (currentCoroutineContext()[Job]?.isCancelled == true) "cancelled" else "failed"
+          reportStatus(TusStatusUpdate(uploadId = uploadId, status = status, error = error.message))
         }
-
-        uploader.finish()
-
-        // Fetch asset ID from server via HEAD request using the upload URL from uploader
-        val assetId = fetchAssetIdFromServer(uploader.uploadURL, data.headers)
-
-        val urlStore = TusPreferencesURLStore(ctx, uploadId)
-        urlStore.clear()
-
-        withContext(Dispatchers.Main) {
-          callbackApi?.onStatusChange(
-            TusStatusUpdate(
-              uploadId = uploadId,
-              status = "completed",
-              assetId = assetId,
-              error = null
-            )
-          ) {}
-        }
-
-        callback(Result.success(uploadId))
-
-      } catch (e: CancellationException) {
-        callback(Result.failure(Exception("Upload cancelled")))
-        withContext(Dispatchers.Main) {
-          callbackApi?.onStatusChange(
-            TusStatusUpdate(
-              uploadId = uploadId,
-              status = "cancelled",
-              assetId = null,
-              error = "Upload cancelled"
-            )
-          ) {}
-        }
-      } catch (e: Exception) {
-        callback(Result.failure(e))
-        withContext(Dispatchers.Main) {
-          callbackApi?.onStatusChange(
-            TusStatusUpdate(
-              uploadId = uploadId,
-              status = "failed",
-              assetId = null,
-              error = e.message
-            )
-          ) {}
-        }
-      } finally {
-        activeUploads.remove(uploadId)
       }
-    }
 
-    activeUploads[uploadId] = job
+    if (activeUploads.putIfAbsent(uploadId, job) != null) {
+      job.cancel()
+      callback(Result.failure(IllegalStateException("Upload is already active")))
+      return
+    }
+    job.invokeOnCompletion { activeUploads.remove(uploadId, job) }
+    callback(Result.success(uploadId))
+    job.start()
   }
 
-  override fun cancelUpload(uploadId: String, callback: (Result<Boolean>) -> Unit) {
+  private suspend fun reportStatus(update: TusStatusUpdate) =
+    withContext(Dispatchers.Main + NonCancellable) {
+      callbackApi?.onStatusChange(update) {}
+    }
+
+  private fun requireUnmeteredNetwork(required: Boolean) {
+    if (required && NetworkCapability.UNMETERED !in connectivity.getCapabilities()) {
+      throw IOException("An unmetered connection is required to upload this file")
+    }
+  }
+
+  private val URL.effectivePort: Int
+    get() = if (port == -1) defaultPort else port
+
+  override fun cancelUpload(
+    uploadId: String,
+    callback: (Result<Boolean>) -> Unit,
+  ) {
     val job = activeUploads[uploadId]
     if (job != null) {
       job.cancel()
-      activeUploads.remove(uploadId)
       callback(Result.success(true))
     } else {
       callback(Result.success(false))
@@ -170,24 +175,13 @@ class TusUploadApiImpl(context: Context) : ImmichPlugin(), TusUploadApi {
 
   private fun cancelAllUploadsSync() {
     activeUploads.values.forEach { it.cancel() }
-    activeUploads.clear()
   }
 
-  override fun getUploadOffset(uploadId: String, callback: (Result<Long?>) -> Unit) {
-    scope.launch {
-      try {
-        val urlStore = TusPreferencesURLStore(ctx, uploadId)
-        val url = urlStore.get(uploadId)
-        if (url != null) {
-          // We would need to make a HEAD request to get the offset
-          callback(Result.success(null))
-        } else {
-          callback(Result.success(null))
-        }
-      } catch (e: Exception) {
-        callback(Result.success(null))
-      }
-    }
+  override fun getUploadOffset(
+    uploadId: String,
+    callback: (Result<Long?>) -> Unit,
+  ) {
+    callback(Result.success(null))
   }
 
   override fun getPendingUploadIds(callback: (Result<List<String>>) -> Unit) {
@@ -210,25 +204,27 @@ class TusUploadApiImpl(context: Context) : ImmichPlugin(), TusUploadApi {
     return metadata
   }
 
-  private fun fetchAssetIdFromServer(
-    uploadUrl: URL?,
-    headers: Map<String, String>
-  ): String? {
-    if (uploadUrl == null) return null
-    return try {
-      val connection = uploadUrl.openConnection() as java.net.HttpURLConnection
+  private data class UploadResult(
+    val assetId: String,
+    val isDuplicate: Boolean,
+  )
+
+  private fun fetchUploadResult(
+    client: TusClient,
+    uploadUrl: URL,
+  ): UploadResult {
+    val connection = uploadUrl.openConnection() as HttpURLConnection
+    try {
       connection.requestMethod = "HEAD"
-      connection.setRequestProperty("Tus-Resumable", "1.0.0")
-      headers.forEach { (key, value) -> connection.setRequestProperty(key, value) }
-      connection.connect()
-
+      client.prepareConnection(connection)
+      val status = connection.responseCode
+      check(status in 200..299) { "Upload completion request failed with status $status" }
       val assetId = connection.getHeaderField("X-Immich-Asset-Id")
-        ?: connection.getHeaderField("x-immich-asset-id")
-
+      val duplicate = connection.getHeaderField("X-Immich-Duplicate")
+      check(!assetId.isNullOrBlank() && (duplicate == "true" || duplicate == "false")) { "The server returned no upload result" }
+      return UploadResult(assetId, duplicate == "true")
+    } finally {
       connection.disconnect()
-      assetId
-    } catch (e: Exception) {
-      null
     }
   }
 }

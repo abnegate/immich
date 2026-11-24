@@ -24,20 +24,20 @@ List<Object?> wrapResponse({Object? result, PlatformException? error, bool empty
   }
   return <Object?>[error.code, error.message, error.details];
 }
+
 bool _deepEquals(Object? a, Object? b) {
   if (a is List && b is List) {
-    return a.length == b.length &&
-        a.indexed
-        .every(((int, dynamic) item) => _deepEquals(item.$2, b[item.$1]));
+    return a.length == b.length && a.indexed.every(((int, dynamic) item) => _deepEquals(item.$2, b[item.$1]));
   }
   if (a is Map && b is Map) {
-    return a.length == b.length && a.entries.every((MapEntry<Object?, Object?> entry) =>
-        (b as Map<Object?, Object?>).containsKey(entry.key) &&
-        _deepEquals(entry.value, b[entry.key]));
+    return a.length == b.length &&
+        a.entries.every(
+          (MapEntry<Object?, Object?> entry) =>
+              (b as Map<Object?, Object?>).containsKey(entry.key) && _deepEquals(entry.value, b[entry.key]),
+        );
   }
   return a == b;
 }
-
 
 /// Metadata for tus upload
 class TusUploadData {
@@ -51,6 +51,7 @@ class TusUploadData {
     required this.fileCreatedAt,
     required this.fileModifiedAt,
     required this.isFavorite,
+    required this.requiresWiFi,
     this.duration,
     this.livePhotoVideoId,
   });
@@ -73,6 +74,8 @@ class TusUploadData {
 
   bool isFavorite;
 
+  bool requiresWiFi;
+
   String? duration;
 
   String? livePhotoVideoId;
@@ -88,13 +91,15 @@ class TusUploadData {
       fileCreatedAt,
       fileModifiedAt,
       isFavorite,
+      requiresWiFi,
       duration,
       livePhotoVideoId,
     ];
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static TusUploadData decode(Object result) {
     result as List<Object?>;
@@ -108,8 +113,9 @@ class TusUploadData {
       fileCreatedAt: result[6]! as String,
       fileModifiedAt: result[7]! as String,
       isFavorite: result[8]! as bool,
-      duration: result[9] as String?,
-      livePhotoVideoId: result[10] as String?,
+      requiresWiFi: result[9]! as bool,
+      duration: result[10] as String?,
+      livePhotoVideoId: result[11] as String?,
     );
   }
 
@@ -127,17 +133,12 @@ class TusUploadData {
 
   @override
   // ignore: avoid_equals_and_hash_code_on_mutable_classes
-  int get hashCode => Object.hashAll(_toList())
-;
+  int get hashCode => Object.hashAll(_toList());
 }
 
 /// Progress update for tus upload
 class TusProgressUpdate {
-  TusProgressUpdate({
-    required this.uploadId,
-    required this.bytesUploaded,
-    required this.totalBytes,
-  });
+  TusProgressUpdate({required this.uploadId, required this.bytesUploaded, required this.totalBytes});
 
   String uploadId;
 
@@ -146,15 +147,12 @@ class TusProgressUpdate {
   int totalBytes;
 
   List<Object?> _toList() {
-    return <Object?>[
-      uploadId,
-      bytesUploaded,
-      totalBytes,
-    ];
+    return <Object?>[uploadId, bytesUploaded, totalBytes];
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static TusProgressUpdate decode(Object result) {
     result as List<Object?>;
@@ -179,18 +177,12 @@ class TusProgressUpdate {
 
   @override
   // ignore: avoid_equals_and_hash_code_on_mutable_classes
-  int get hashCode => Object.hashAll(_toList())
-;
+  int get hashCode => Object.hashAll(_toList());
 }
 
 /// Status update for tus upload
 class TusStatusUpdate {
-  TusStatusUpdate({
-    required this.uploadId,
-    required this.status,
-    this.assetId,
-    this.error,
-  });
+  TusStatusUpdate({required this.uploadId, required this.status, this.assetId, this.isDuplicate, this.error});
 
   String uploadId;
 
@@ -198,19 +190,17 @@ class TusStatusUpdate {
 
   String? assetId;
 
+  bool? isDuplicate;
+
   String? error;
 
   List<Object?> _toList() {
-    return <Object?>[
-      uploadId,
-      status,
-      assetId,
-      error,
-    ];
+    return <Object?>[uploadId, status, assetId, isDuplicate, error];
   }
 
   Object encode() {
-    return _toList();  }
+    return _toList();
+  }
 
   static TusStatusUpdate decode(Object result) {
     result as List<Object?>;
@@ -218,7 +208,8 @@ class TusStatusUpdate {
       uploadId: result[0]! as String,
       status: result[1]! as String,
       assetId: result[2] as String?,
-      error: result[3] as String?,
+      isDuplicate: result[3] as bool?,
+      error: result[4] as String?,
     );
   }
 
@@ -236,10 +227,8 @@ class TusStatusUpdate {
 
   @override
   // ignore: avoid_equals_and_hash_code_on_mutable_classes
-  int get hashCode => Object.hashAll(_toList())
-;
+  int get hashCode => Object.hashAll(_toList());
 }
-
 
 class _PigeonCodec extends StandardMessageCodec {
   const _PigeonCodec();
@@ -248,13 +237,13 @@ class _PigeonCodec extends StandardMessageCodec {
     if (value is int) {
       buffer.putUint8(4);
       buffer.putInt64(value);
-    }    else if (value is TusUploadData) {
+    } else if (value is TusUploadData) {
       buffer.putUint8(129);
       writeValue(buffer, value.encode());
-    }    else if (value is TusProgressUpdate) {
+    } else if (value is TusProgressUpdate) {
       buffer.putUint8(130);
       writeValue(buffer, value.encode());
-    }    else if (value is TusStatusUpdate) {
+    } else if (value is TusStatusUpdate) {
       buffer.putUint8(131);
       writeValue(buffer, value.encode());
     } else {
@@ -265,11 +254,11 @@ class _PigeonCodec extends StandardMessageCodec {
   @override
   Object? readValueOfType(int type, ReadBuffer buffer) {
     switch (type) {
-      case 129: 
+      case 129:
         return TusUploadData.decode(readValue(buffer)!);
-      case 130: 
+      case 130:
         return TusProgressUpdate.decode(readValue(buffer)!);
-      case 131: 
+      case 131:
         return TusStatusUpdate.decode(readValue(buffer)!);
       default:
         return super.readValueOfType(type, buffer);
@@ -283,8 +272,8 @@ class TusUploadApi {
   /// available for dependency injection.  If it is left null, the default
   /// BinaryMessenger will be used which routes to the host platform.
   TusUploadApi({BinaryMessenger? binaryMessenger, String messageChannelSuffix = ''})
-      : pigeonVar_binaryMessenger = binaryMessenger,
-        pigeonVar_messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
+    : pigeonVar_binaryMessenger = binaryMessenger,
+      pigeonVar_messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
   final BinaryMessenger? pigeonVar_binaryMessenger;
 
   static const MessageCodec<Object?> pigeonChannelCodec = _PigeonCodec();
@@ -294,15 +283,15 @@ class TusUploadApi {
   /// Upload a file using the tus protocol
   /// Returns the upload ID that can be used to track progress or cancel
   Future<String> startUpload(TusUploadData data) async {
-    final String pigeonVar_channelName = 'dev.flutter.pigeon.immich_mobile.TusUploadApi.startUpload$pigeonVar_messageChannelSuffix';
+    final String pigeonVar_channelName =
+        'dev.flutter.pigeon.immich_mobile.TusUploadApi.startUpload$pigeonVar_messageChannelSuffix';
     final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
     final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[data]);
-    final List<Object?>? pigeonVar_replyList =
-        await pigeonVar_sendFuture as List<Object?>?;
+    final List<Object?>? pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
     if (pigeonVar_replyList == null) {
       throw _createConnectionError(pigeonVar_channelName);
     } else if (pigeonVar_replyList.length > 1) {
@@ -323,15 +312,15 @@ class TusUploadApi {
 
   /// Cancel an ongoing upload
   Future<bool> cancelUpload(String uploadId) async {
-    final String pigeonVar_channelName = 'dev.flutter.pigeon.immich_mobile.TusUploadApi.cancelUpload$pigeonVar_messageChannelSuffix';
+    final String pigeonVar_channelName =
+        'dev.flutter.pigeon.immich_mobile.TusUploadApi.cancelUpload$pigeonVar_messageChannelSuffix';
     final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
     final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[uploadId]);
-    final List<Object?>? pigeonVar_replyList =
-        await pigeonVar_sendFuture as List<Object?>?;
+    final List<Object?>? pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
     if (pigeonVar_replyList == null) {
       throw _createConnectionError(pigeonVar_channelName);
     } else if (pigeonVar_replyList.length > 1) {
@@ -352,15 +341,15 @@ class TusUploadApi {
 
   /// Cancel all ongoing uploads
   Future<void> cancelAllUploads() async {
-    final String pigeonVar_channelName = 'dev.flutter.pigeon.immich_mobile.TusUploadApi.cancelAllUploads$pigeonVar_messageChannelSuffix';
+    final String pigeonVar_channelName =
+        'dev.flutter.pigeon.immich_mobile.TusUploadApi.cancelAllUploads$pigeonVar_messageChannelSuffix';
     final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
     final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(null);
-    final List<Object?>? pigeonVar_replyList =
-        await pigeonVar_sendFuture as List<Object?>?;
+    final List<Object?>? pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
     if (pigeonVar_replyList == null) {
       throw _createConnectionError(pigeonVar_channelName);
     } else if (pigeonVar_replyList.length > 1) {
@@ -376,15 +365,15 @@ class TusUploadApi {
 
   /// Get the current offset of an upload (for resumption)
   Future<int?> getUploadOffset(String uploadId) async {
-    final String pigeonVar_channelName = 'dev.flutter.pigeon.immich_mobile.TusUploadApi.getUploadOffset$pigeonVar_messageChannelSuffix';
+    final String pigeonVar_channelName =
+        'dev.flutter.pigeon.immich_mobile.TusUploadApi.getUploadOffset$pigeonVar_messageChannelSuffix';
     final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
     final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[uploadId]);
-    final List<Object?>? pigeonVar_replyList =
-        await pigeonVar_sendFuture as List<Object?>?;
+    final List<Object?>? pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
     if (pigeonVar_replyList == null) {
       throw _createConnectionError(pigeonVar_channelName);
     } else if (pigeonVar_replyList.length > 1) {
@@ -400,15 +389,15 @@ class TusUploadApi {
 
   /// Check if there are any pending uploads that can be resumed
   Future<List<String>> getPendingUploadIds() async {
-    final String pigeonVar_channelName = 'dev.flutter.pigeon.immich_mobile.TusUploadApi.getPendingUploadIds$pigeonVar_messageChannelSuffix';
+    final String pigeonVar_channelName =
+        'dev.flutter.pigeon.immich_mobile.TusUploadApi.getPendingUploadIds$pigeonVar_messageChannelSuffix';
     final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
     final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(null);
-    final List<Object?>? pigeonVar_replyList =
-        await pigeonVar_sendFuture as List<Object?>?;
+    final List<Object?>? pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
     if (pigeonVar_replyList == null) {
       throw _createConnectionError(pigeonVar_channelName);
     } else if (pigeonVar_replyList.length > 1) {
@@ -438,54 +427,70 @@ abstract class TusUploadCallbackApi {
   /// Called when upload status changes
   void onStatusChange(TusStatusUpdate update);
 
-  static void setUp(TusUploadCallbackApi? api, {BinaryMessenger? binaryMessenger, String messageChannelSuffix = '',}) {
+  static void setUp(TusUploadCallbackApi? api, {BinaryMessenger? binaryMessenger, String messageChannelSuffix = ''}) {
     messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
     {
       final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
-          'dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onProgress$messageChannelSuffix', pigeonChannelCodec,
-          binaryMessenger: binaryMessenger);
+        'dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onProgress$messageChannelSuffix',
+        pigeonChannelCodec,
+        binaryMessenger: binaryMessenger,
+      );
       if (api == null) {
         pigeonVar_channel.setMessageHandler(null);
       } else {
         pigeonVar_channel.setMessageHandler((Object? message) async {
-          assert(message != null,
-          'Argument for dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onProgress was null.');
+          assert(
+            message != null,
+            'Argument for dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onProgress was null.',
+          );
           final List<Object?> args = (message as List<Object?>?)!;
           final TusProgressUpdate? arg_update = (args[0] as TusProgressUpdate?);
-          assert(arg_update != null,
-              'Argument for dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onProgress was null, expected non-null TusProgressUpdate.');
+          assert(
+            arg_update != null,
+            'Argument for dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onProgress was null, expected non-null TusProgressUpdate.',
+          );
           try {
             api.onProgress(arg_update!);
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);
-          }          catch (e) {
-            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          } catch (e) {
+            return wrapResponse(
+              error: PlatformException(code: 'error', message: e.toString()),
+            );
           }
         });
       }
     }
     {
       final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
-          'dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onStatusChange$messageChannelSuffix', pigeonChannelCodec,
-          binaryMessenger: binaryMessenger);
+        'dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onStatusChange$messageChannelSuffix',
+        pigeonChannelCodec,
+        binaryMessenger: binaryMessenger,
+      );
       if (api == null) {
         pigeonVar_channel.setMessageHandler(null);
       } else {
         pigeonVar_channel.setMessageHandler((Object? message) async {
-          assert(message != null,
-          'Argument for dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onStatusChange was null.');
+          assert(
+            message != null,
+            'Argument for dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onStatusChange was null.',
+          );
           final List<Object?> args = (message as List<Object?>?)!;
           final TusStatusUpdate? arg_update = (args[0] as TusStatusUpdate?);
-          assert(arg_update != null,
-              'Argument for dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onStatusChange was null, expected non-null TusStatusUpdate.');
+          assert(
+            arg_update != null,
+            'Argument for dev.flutter.pigeon.immich_mobile.TusUploadCallbackApi.onStatusChange was null, expected non-null TusStatusUpdate.',
+          );
           try {
             api.onStatusChange(arg_update!);
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);
-          }          catch (e) {
-            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          } catch (e) {
+            return wrapResponse(
+              error: PlatformException(code: 'error', message: e.toString()),
+            );
           }
         });
       }

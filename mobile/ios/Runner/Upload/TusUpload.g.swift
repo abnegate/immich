@@ -11,8 +11,23 @@ import Foundation
   #error("Unsupported platform.")
 #endif
 
-// PigeonError class is already defined in Messages.g.swift
-// Removed duplicate to avoid ambiguity errors
+/// Error class for passing custom error details to Dart side.
+final class PigeonError: Error {
+  let code: String
+  let message: String?
+  let details: Sendable?
+
+  init(code: String, message: String?, details: Sendable?) {
+    self.code = code
+    self.message = message
+    self.details = details
+  }
+
+  var localizedDescription: String {
+    return
+      "PigeonError(code: \(code), message: \(message ?? "<nil>"), details: \(details ?? "<nil>")"
+  }
+}
 
 private func wrapResult(_ result: Any?) -> [Any?] {
   return [result]
@@ -130,6 +145,7 @@ struct TusUploadData: Hashable {
   var fileCreatedAt: String
   var fileModifiedAt: String
   var isFavorite: Bool
+  var requiresWiFi: Bool
   var duration: String? = nil
   var livePhotoVideoId: String? = nil
 
@@ -145,8 +161,9 @@ struct TusUploadData: Hashable {
     let fileCreatedAt = pigeonVar_list[6] as! String
     let fileModifiedAt = pigeonVar_list[7] as! String
     let isFavorite = pigeonVar_list[8] as! Bool
-    let duration: String? = nilOrValue(pigeonVar_list[9])
-    let livePhotoVideoId: String? = nilOrValue(pigeonVar_list[10])
+    let requiresWiFi = pigeonVar_list[9] as! Bool
+    let duration: String? = nilOrValue(pigeonVar_list[10])
+    let livePhotoVideoId: String? = nilOrValue(pigeonVar_list[11])
 
     return TusUploadData(
       filePath: filePath,
@@ -158,6 +175,7 @@ struct TusUploadData: Hashable {
       fileCreatedAt: fileCreatedAt,
       fileModifiedAt: fileModifiedAt,
       isFavorite: isFavorite,
+      requiresWiFi: requiresWiFi,
       duration: duration,
       livePhotoVideoId: livePhotoVideoId
     )
@@ -173,6 +191,7 @@ struct TusUploadData: Hashable {
       fileCreatedAt,
       fileModifiedAt,
       isFavorite,
+      requiresWiFi,
       duration,
       livePhotoVideoId,
     ]
@@ -226,6 +245,7 @@ struct TusStatusUpdate: Hashable {
   var uploadId: String
   var status: String
   var assetId: String? = nil
+  var isDuplicate: Bool? = nil
   var error: String? = nil
 
 
@@ -234,12 +254,14 @@ struct TusStatusUpdate: Hashable {
     let uploadId = pigeonVar_list[0] as! String
     let status = pigeonVar_list[1] as! String
     let assetId: String? = nilOrValue(pigeonVar_list[2])
-    let error: String? = nilOrValue(pigeonVar_list[3])
+    let isDuplicate: Bool? = nilOrValue(pigeonVar_list[3])
+    let error: String? = nilOrValue(pigeonVar_list[4])
 
     return TusStatusUpdate(
       uploadId: uploadId,
       status: status,
       assetId: assetId,
+      isDuplicate: isDuplicate,
       error: error
     )
   }
@@ -248,6 +270,7 @@ struct TusStatusUpdate: Hashable {
       uploadId,
       status,
       assetId,
+      isDuplicate,
       error,
     ]
   }
