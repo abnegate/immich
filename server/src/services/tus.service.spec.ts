@@ -1,6 +1,6 @@
 import { BadRequestException } from '@nestjs/common';
-import { Stats } from 'node:fs';
 import { Request, Response } from 'express';
+import { Stats } from 'node:fs';
 import { AssetFileType, AssetType, AssetVisibility, JobName } from 'src/enum';
 import { TusService } from 'src/services/tus.service';
 import { authStub } from 'test/fixtures/auth.stub';
@@ -13,7 +13,7 @@ vi.mock('@tus/server', () => ({
     // Store the options for testing
     return {
       options,
-      handle: vi.fn().mockResolvedValue(undefined),
+      handle: vi.fn().mockImplementation(() => Promise.resolve()),
     };
   }),
 }));
@@ -55,6 +55,25 @@ const mockUploadVideo = {
   },
 };
 
+// Helper to create mock request with Web API Headers (as TUS library provides)
+const createMockRequest = (userId?: string, quotaSize?: number | null, quotaUsage?: number) => {
+  const headersMap = new Map<string, string>();
+  if (userId) {
+    headersMap.set('x-immich-user-id', userId);
+  }
+  if (quotaSize !== undefined) {
+    headersMap.set('x-immich-quota-size', String(quotaSize ?? ''));
+  }
+  if (quotaUsage !== undefined) {
+    headersMap.set('x-immich-quota-usage', String(quotaUsage));
+  }
+  return {
+    headers: {
+      get: (name: string) => headersMap.get(name) ?? null,
+    },
+  };
+};
+
 describe(TusService.name, () => {
   let sut: TusService;
   let mocks: ServiceMocks;
@@ -62,7 +81,7 @@ describe(TusService.name, () => {
   beforeEach(() => {
     ({ sut, mocks } = newTestService(TusService));
     // Mock storage mkdirSync to avoid filesystem operations
-    mocks.storage.mkdirSync.mockReturnValue(undefined);
+    mocks.storage.mkdirSync.mockImplementation(() => {});
   });
 
   describe('parseMetadata', () => {
@@ -93,7 +112,7 @@ describe(TusService.name, () => {
     });
 
     it('should handle missing metadata gracefully', () => {
-      const result = (sut as any).parseMetadata(undefined);
+      const result = (sut as any).parseMetadata();
       expect(result).toEqual({});
     });
 
@@ -173,30 +192,11 @@ describe(TusService.name, () => {
   });
 
   describe('onUploadCreate validation', () => {
-    // Helper to create mock request with Web API Headers (as TUS library provides)
-    const createMockReq = (userId?: string, quotaSize?: number | null, quotaUsage?: number) => {
-      const headersMap = new Map<string, string>();
-      if (userId) {
-        headersMap.set('x-immich-user-id', userId);
-      }
-      if (quotaSize !== undefined) {
-        headersMap.set('x-immich-quota-size', String(quotaSize ?? ''));
-      }
-      if (quotaUsage !== undefined) {
-        headersMap.set('x-immich-quota-usage', String(quotaUsage));
-      }
-      return {
-        headers: {
-          get: (name: string) => headersMap.get(name) ?? null,
-        },
-      };
-    };
-
     let mockReq: any;
     let upload: any;
 
     beforeEach(() => {
-      mockReq = createMockReq(authStub.user1.user.id, null, 0);
+      mockReq = createMockRequest(authStub.user1.user.id, null, 0);
       // TUS library decodes base64 metadata before passing to callbacks
       upload = {
         id: 'upload-id',
@@ -210,7 +210,7 @@ describe(TusService.name, () => {
     });
 
     it('should reject if user not authenticated', async () => {
-      mockReq = createMockReq(); // No user ID
+      mockReq = createMockRequest(); // No user ID
 
       const tusServer = await (sut as any).initializeTusServer();
       const onUploadCreate = (tusServer as any).options.onUploadCreate;
@@ -283,7 +283,7 @@ describe(TusService.name, () => {
     });
 
     it('should reject if quota exceeded', async () => {
-      mockReq = createMockReq(authStub.user1.user.id, 1000, 500);
+      mockReq = createMockRequest(authStub.user1.user.id, 1000, 500);
       upload.size = 600; // Would exceed quota
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -320,7 +320,7 @@ describe(TusService.name, () => {
     });
 
     it('should allow upload when quota is null (unlimited)', async () => {
-      mockReq = createMockReq(authStub.user1.user.id, null, 500);
+      mockReq = createMockRequest(authStub.user1.user.id, null, 500);
       upload.size = 1_000_000; // Large file
 
       const tusServer = await (sut as any).initializeTusServer();
@@ -332,8 +332,8 @@ describe(TusService.name, () => {
     });
 
     it('should allow upload when quota not exceeded', async () => {
-      mockReq = createMockReq(authStub.user1.user.id, 10_000, 5_000);
-      upload.size = 4_000; // Within quota
+      mockReq = createMockRequest(authStub.user1.user.id, 10_000, 5000);
+      upload.size = 4000; // Within quota
 
       const tusServer = await (sut as any).initializeTusServer();
       const onUploadCreate = (tusServer as any).options.onUploadCreate;
@@ -359,7 +359,6 @@ describe(TusService.name, () => {
     it('should create asset with correct metadata', async () => {
       const upload = mockUpload;
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -396,16 +395,12 @@ describe(TusService.name, () => {
 
       expect(result).toEqual({ assetId: 'existing-asset-id', isDuplicate: true });
       expect(mocks.asset.create).not.toHaveBeenCalled();
-      expect(mocks.job.queue).toHaveBeenCalledWith({
-        name: JobName.FileDelete,
-        data: { files: ['/data/upload/upload-id.jpg'] },
-      });
+      expect(mocks.job.queue).not.toHaveBeenCalled();
     });
 
     it('should handle sidecar data', async () => {
       const upload = mockUploadWithSidecar;
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -428,7 +423,6 @@ describe(TusService.name, () => {
     it('should handle sidecar write errors gracefully', async () => {
       const upload = mockUploadWithSidecar;
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -450,7 +444,6 @@ describe(TusService.name, () => {
     it('should update user quota', async () => {
       const upload = mockUpload;
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -464,7 +457,6 @@ describe(TusService.name, () => {
     it('should queue metadata extraction job', async () => {
       const upload = mockUpload;
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -481,7 +473,6 @@ describe(TusService.name, () => {
     it('should emit AssetCreate event', async () => {
       const upload = mockUpload;
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -497,7 +488,6 @@ describe(TusService.name, () => {
     it('should handle video assets correctly', async () => {
       const upload = mockUploadVideo;
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -523,7 +513,6 @@ describe(TusService.name, () => {
         },
       };
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -547,7 +536,6 @@ describe(TusService.name, () => {
         },
       };
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -571,7 +559,6 @@ describe(TusService.name, () => {
         },
       };
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -595,7 +582,6 @@ describe(TusService.name, () => {
         },
       };
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -619,7 +605,6 @@ describe(TusService.name, () => {
         },
       };
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -637,7 +622,6 @@ describe(TusService.name, () => {
     it('should update file timestamps', async () => {
       const upload = mockUpload;
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -655,7 +639,6 @@ describe(TusService.name, () => {
     it('should upsert exif with file size', async () => {
       const upload = mockUpload;
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -715,7 +698,6 @@ describe(TusService.name, () => {
         },
       };
 
-      mocks.asset.getUploadAssetIdByChecksum.mockResolvedValue(null);
       mocks.asset.create.mockResolvedValue({
         id: 'asset-id',
         ownerId: userId,
@@ -748,7 +730,7 @@ describe(TusService.name, () => {
       const mockReq = { headers: {} } as unknown as Request;
       const mockRes = {} as Response;
 
-      const mockHandle = vi.fn().mockResolvedValue(undefined);
+      const mockHandle = vi.fn().mockImplementation(() => Promise.resolve());
       const mockServer = {
         handle: mockHandle,
       };
@@ -765,11 +747,87 @@ describe(TusService.name, () => {
     });
   });
 
+  describe('completed uploads', () => {
+    const auth = {
+      ...authStub.user1,
+      user: { ...authStub.user1.user, id: 'febfcca0-9aaa-49de-9676-4044e5a5cd58' },
+    };
+    const uploadId = `${auth.user.id}/de/fa/defab6b4-85ac-4938-9f2e-305742a7bdf3`;
+    const assetId = '83dbc180-6560-421a-8a7a-0da2bb6a2250';
+    const upload = { ...mockUpload, id: uploadId, creation_date: new Date().toISOString(), metadata: undefined };
+
+    it('should retrieve the persisted asset ID after the upload file has moved', async () => {
+      mocks.storage.readTextFile.mockResolvedValue(
+        JSON.stringify({ ...upload, result: { assetId, isDuplicate: false } }),
+      );
+      const request = {
+        method: 'HEAD',
+        url: `/api/upload/${uploadId}`,
+        headers: { 'tus-resumable': '1.0.0' },
+      } as unknown as Request;
+      const response = {
+        setHeader: vi.fn(),
+        end: vi.fn(),
+      } as unknown as Response;
+
+      await sut.handleTusUpload(auth, request, response);
+
+      expect(mocks.storage.readTextFile).toHaveBeenCalledWith(`/data/upload/${uploadId}.json`);
+      expect(response.setHeader).toHaveBeenCalledWith('X-Immich-Asset-Id', assetId);
+      expect(response.setHeader).toHaveBeenCalledWith('X-Immich-Duplicate', 'false');
+      expect(response.setHeader).toHaveBeenCalledWith('Upload-Offset', '1000');
+      expect(response.statusCode).toBe(200);
+      expect(response.end).toHaveBeenCalled();
+    });
+
+    it('should keep completed asset bytes even if tus stored a stale offset', async () => {
+      const path = `/data/upload/${uploadId}`;
+      const [owner, first, second, filename] = uploadId.split('/');
+      mocks.storage.readdir
+        .mockResolvedValueOnce([owner])
+        .mockResolvedValueOnce([first])
+        .mockResolvedValueOnce([second])
+        .mockResolvedValueOnce([`${filename}.json`]);
+      mocks.storage.readTextFile.mockResolvedValue(
+        JSON.stringify({ ...upload, offset: 0, creation_date: '2023-01-01T00:00:00.000Z' }),
+      );
+      mocks.storage.stat.mockResolvedValue({ size: upload.size } as Stats);
+
+      await sut.handleUploadCleanup();
+
+      expect(mocks.storage.unlink).toHaveBeenCalledExactlyOnceWith(`${path}.json`);
+    });
+
+    it('should remove an expired nested partial upload and its metadata', async () => {
+      const path = `/data/upload/${uploadId}`;
+      const [owner, first, second, filename] = uploadId.split('/');
+      mocks.storage.readdir
+        .mockResolvedValueOnce([owner])
+        .mockResolvedValueOnce([first])
+        .mockResolvedValueOnce([second])
+        .mockResolvedValueOnce([`${filename}.json`]);
+      mocks.storage.readTextFile.mockResolvedValue(
+        JSON.stringify({ ...upload, creation_date: '2023-01-01T00:00:00.000Z' }),
+      );
+      mocks.storage.stat.mockResolvedValue({ size: 100 } as Stats);
+
+      await sut.handleUploadCleanup();
+
+      expect(mocks.storage.unlink.mock.calls).toEqual([[path], [`${path}.json`]]);
+    });
+
+    it('should configure tus to protect the bytes of completed uploads from termination', async () => {
+      const server = await (sut as any).initializeTusServer();
+
+      expect(server.options.disableTerminationForFinishedUploads).toBe(true);
+    });
+  });
+
   describe('onApplicationShutdown', () => {
-    it('should reset server state on shutdown', async () => {
+    it('should reset server state on shutdown', () => {
       // Set up the internal state to simulate an initialized server
       const mockServer = {
-        handle: vi.fn().mockResolvedValue(undefined),
+        handle: vi.fn().mockImplementation(() => Promise.resolve()),
       };
       (sut as any).tusServer = mockServer;
       (sut as any).initPromise = Promise.resolve();
@@ -778,20 +836,20 @@ describe(TusService.name, () => {
       expect((sut as any).tusServer).toBeTruthy();
 
       // Call shutdown
-      await sut.onApplicationShutdown();
+      sut.onApplicationShutdown();
 
       // Verify state was reset
       expect((sut as any).tusServer).toBeNull();
       expect((sut as any).initPromise).toBeNull();
     });
 
-    it('should handle shutdown when server not initialized', async () => {
+    it('should handle shutdown when server not initialized', () => {
       // Ensure server is not initialized
       (sut as any).tusServer = null;
       (sut as any).initPromise = null;
 
       // Call shutdown without initializing server
-      await expect(sut.onApplicationShutdown()).resolves.not.toThrow();
+      expect(() => sut.onApplicationShutdown()).not.toThrow();
 
       // Verify state is still null
       expect((sut as any).tusServer).toBeNull();

@@ -1,7 +1,13 @@
+import { Response } from 'express';
 import { TusController } from 'src/controllers/tus.controller';
 import { TusService } from 'src/services/tus.service';
 import request from 'supertest';
 import { ControllerContext, controllerSetup, mockBaseService } from 'test/utils';
+
+function respond(response: Response, status: number): Promise<void> {
+  response.status(status).send();
+  return Promise.resolve();
+}
 
 describe(TusController.name, () => {
   let ctx: ControllerContext;
@@ -19,17 +25,13 @@ describe(TusController.name, () => {
 
   describe('ALL /upload', () => {
     it('should be an authenticated route', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(200).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
       await request(ctx.getHttpServer()).post('/upload');
       expect(ctx.authenticate).toHaveBeenCalled();
     });
 
     it('should call service.handleTusUpload for POST', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(200).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
 
       await request(ctx.getHttpServer())
         .post('/upload')
@@ -42,9 +44,7 @@ describe(TusController.name, () => {
     });
 
     it('should call service.handleTusUpload for PATCH', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(204).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 204));
 
       await request(ctx.getHttpServer())
         .patch('/upload')
@@ -57,9 +57,7 @@ describe(TusController.name, () => {
     });
 
     it('should call service.handleTusUpload for HEAD', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(200).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
 
       await request(ctx.getHttpServer()).head('/upload');
 
@@ -69,9 +67,7 @@ describe(TusController.name, () => {
     });
 
     it('should call service.handleTusUpload for DELETE', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(204).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 204));
 
       await request(ctx.getHttpServer()).delete('/upload');
 
@@ -80,16 +76,15 @@ describe(TusController.name, () => {
       expect(req.method).toBe('DELETE');
     });
 
-    it('should call service.handleTusUpload for OPTIONS', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(204).send();
-      });
+    it('should handle OPTIONS without authentication', async () => {
+      service.handleTusOptions.mockImplementation((_request, response) => respond(response, 204));
 
       await request(ctx.getHttpServer()).options('/upload');
 
-      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
-      const [, req] = service.handleTusUpload.mock.calls[0];
-      expect(req.method).toBe('OPTIONS');
+      expect(ctx.authenticate).not.toHaveBeenCalled();
+      expect(service.handleTusOptions).toHaveBeenCalledTimes(1);
+      const [httpRequest] = service.handleTusOptions.mock.calls[0];
+      expect(httpRequest.method).toBe('OPTIONS');
     });
 
     it('should handle service errors', async () => {
@@ -107,21 +102,15 @@ describe(TusController.name, () => {
     const uploadId = 'test-upload-id-123';
 
     it('should be an authenticated route', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(200).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
       await request(ctx.getHttpServer()).post(`/upload/${uploadId}`);
       expect(ctx.authenticate).toHaveBeenCalled();
     });
 
     it('should call service.handleTusUpload with upload ID in URL for POST', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(200).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
 
-      await request(ctx.getHttpServer())
-        .post(`/upload/${uploadId}`)
-        .set('Upload-Length', '1000');
+      await request(ctx.getHttpServer()).post(`/upload/${uploadId}`).set('Upload-Length', '1000');
 
       expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
       const [, req] = service.handleTusUpload.mock.calls[0];
@@ -130,9 +119,7 @@ describe(TusController.name, () => {
     });
 
     it('should call service.handleTusUpload for PATCH with upload ID', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(204).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 204));
 
       await request(ctx.getHttpServer())
         .patch(`/upload/${uploadId}`)
@@ -147,9 +134,7 @@ describe(TusController.name, () => {
     });
 
     it('should call service.handleTusUpload for HEAD with upload ID', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(200).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
 
       await request(ctx.getHttpServer()).head(`/upload/${uploadId}`);
 
@@ -160,9 +145,7 @@ describe(TusController.name, () => {
     });
 
     it('should call service.handleTusUpload for DELETE with upload ID', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(204).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 204));
 
       await request(ctx.getHttpServer()).delete(`/upload/${uploadId}`);
 
@@ -172,17 +155,16 @@ describe(TusController.name, () => {
       expect(req.url).toContain(uploadId);
     });
 
-    it('should call service.handleTusUpload for OPTIONS with upload ID', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(204).send();
-      });
+    it('should handle upload-specific OPTIONS without authentication', async () => {
+      service.handleTusOptions.mockImplementation((_request, response) => respond(response, 204));
 
       await request(ctx.getHttpServer()).options(`/upload/${uploadId}`);
 
-      expect(service.handleTusUpload).toHaveBeenCalledTimes(1);
-      const [, req] = service.handleTusUpload.mock.calls[0];
-      expect(req.method).toBe('OPTIONS');
-      expect(req.url).toContain(uploadId);
+      expect(ctx.authenticate).not.toHaveBeenCalled();
+      expect(service.handleTusOptions).toHaveBeenCalledTimes(1);
+      const [httpRequest] = service.handleTusOptions.mock.calls[0];
+      expect(httpRequest.method).toBe('OPTIONS');
+      expect(httpRequest.url).toContain(uploadId);
     });
 
     it('should handle service errors', async () => {
@@ -194,9 +176,7 @@ describe(TusController.name, () => {
     });
 
     it('should handle different upload IDs', async () => {
-      service.handleTusUpload.mockImplementation(async (_auth, _req, res) => {
-        res.status(200).send();
-      });
+      service.handleTusUpload.mockImplementation((_auth, _req, response) => respond(response, 200));
       const differentId = 'different-upload-id-456';
 
       await request(ctx.getHttpServer()).head(`/upload/${differentId}`);
