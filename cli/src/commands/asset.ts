@@ -16,6 +16,7 @@ import { Matcher, watch as watchFs } from 'chokidar';
 import { MultiBar, Presets, SingleBar } from 'cli-progress';
 import { chunk } from 'lodash-es';
 import micromatch from 'micromatch';
+import { createHash } from 'node:crypto';
 import { createReadStream, type ReadStream, type Stats } from 'node:fs';
 import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -26,19 +27,16 @@ import { BaseOptions, Batcher, authenticate, crawl, sha1 } from 'src/utils';
 import * as tus from 'tus-js-client';
 
 class FileUrlStorage implements tus.UrlStorage {
-  private cacheDir: string;
+  private readonly directory = join(homedir(), '.cache', 'immich-cli', 'tus-uploads');
 
-  constructor() {
-    this.cacheDir = join(homedir(), '.cache', 'immich-cli', 'tus-uploads');
+  private async ensureDirectory(): Promise<void> {
+    await mkdir(this.directory, { recursive: true });
   }
 
-  private async ensureDir() {
-    await mkdir(this.cacheDir, { recursive: true });
-  }
-
-  private getFilePath(fingerprint: string): string {
-    const safeFingerprint = Buffer.from(fingerprint).toString('base64url');
-    return join(this.cacheDir, `${safeFingerprint}.json`);
+  private paths(fingerprint: string): [current: string, legacy: string] {
+    const hash = createHash('sha256').update(fingerprint).digest('hex');
+    const legacy = Buffer.from(fingerprint).toString('base64url');
+    return [join(this.directory, `${hash}.json`), join(this.directory, `${legacy}.json`)];
   }
 
   async findAllUploads(): Promise<tus.PreviousUpload[]> {
@@ -47,30 +45,32 @@ class FileUrlStorage implements tus.UrlStorage {
 
   async findUploadsByFingerprint(fingerprint: string): Promise<tus.PreviousUpload[]> {
     try {
-      await this.ensureDir();
-      const filePath = this.getFilePath(fingerprint);
-      const data = await readFile(filePath, 'utf8');
-      const upload = JSON.parse(data) as tus.PreviousUpload;
-      return [{ ...upload, urlStorageKey: fingerprint }];
+      await this.ensureDirectory();
     } catch {
       return [];
     }
+
+    for (const filename of this.paths(fingerprint)) {
+      try {
+        const data = await readFile(filename, 'utf8');
+        const upload = JSON.parse(data) as tus.PreviousUpload;
+        return [{ ...upload, urlStorageKey: fingerprint }];
+      } catch {
+        // The other cache filename may still contain the resume URL.
+      }
+    }
+    return [];
   }
 
   async removeUpload(fingerprint: string): Promise<void> {
-    try {
-      const filePath = this.getFilePath(fingerprint);
-      await unlink(filePath);
-    } catch {
-      // Ignore errors if file doesn't exist
-    }
+    await Promise.allSettled(this.paths(fingerprint).map((filename) => unlink(filename)));
   }
 
   async addUpload(fingerprint: string, upload: tus.PreviousUpload): Promise<string> {
     try {
-      await this.ensureDir();
-      const filePath = this.getFilePath(fingerprint);
-      await writeFile(filePath, JSON.stringify(upload));
+      await this.ensureDirectory();
+      const [filename] = this.paths(fingerprint);
+      await writeFile(filename, JSON.stringify(upload));
       return fingerprint;
     } catch {
       // tus accepts an empty storage key when no resume entry was saved.

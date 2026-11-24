@@ -1,5 +1,5 @@
 import * as fs from 'node:fs';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -505,6 +505,50 @@ describe('uploadFiles with resumable option', () => {
       await expect(storage!.findUploadsByFingerprint('test-key')).resolves.toEqual([
         { uploadUrl: 'http://example.com/upload/pending', urlStorageKey: 'test-key' },
       ]);
+    });
+
+    it('stores a long fingerprint in a bounded cache filename', async () => {
+      await uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true });
+      const storage = startUpload.mock.calls[0][0].urlStorage!;
+      const fingerprint = `node-file-${'directory/'.repeat(40)}video.mp4`;
+      vi.mocked(mkdir).mockResolvedValueOnce('unused-cache-directory');
+      vi.mocked(writeFile).mockImplementationOnce((filename) => {
+        expect(path.basename(String(filename))).toMatch(/^[a-f\d]{64}\.json$/);
+        return Promise.resolve();
+      });
+
+      await expect(
+        storage.addUpload(fingerprint, {
+          uploadUrl: 'http://example.com/upload/pending',
+          metadata: {},
+          size: 75 * 1024 * 1024,
+          creationTime: '',
+          urlStorageKey: '',
+          parallelUploadUrls: null, // eslint-disable-line unicorn/no-null -- tus expects null for non-parallel transfers.
+        }),
+      ).resolves.toBe(fingerprint);
+    });
+
+    it('reads and removes a resume URL cached by the previous CLI', async () => {
+      await uploadFiles([largeTestFilePath], { concurrency: 1, resumable: true });
+      const storage = startUpload.mock.calls[0][0].urlStorage!;
+      const fingerprint = 'node-file-existing.mp4';
+      const legacyFilename = `${Buffer.from(fingerprint).toString('base64url')}.json`;
+      const uploadUrl = 'http://example.com/upload/previous';
+      vi.mocked(mkdir).mockResolvedValueOnce('unused-cache-directory');
+      vi.mocked(readFile)
+        .mockRejectedValueOnce(new Error('File not found'))
+        .mockResolvedValueOnce(JSON.stringify({ uploadUrl }));
+      vi.mocked(unlink)
+        .mockImplementationOnce(() => Promise.resolve())
+        .mockImplementationOnce(() => Promise.resolve());
+
+      await expect(storage.findUploadsByFingerprint(fingerprint)).resolves.toEqual([
+        { uploadUrl, urlStorageKey: fingerprint },
+      ]);
+      expect(readFile).toHaveBeenLastCalledWith(expect.stringContaining(legacyFilename), 'utf8');
+      await storage.removeUpload(fingerprint);
+      expect(unlink).toHaveBeenCalledWith(expect.stringContaining(legacyFilename));
     });
 
     it('uses multipart when the server has no tus creation endpoint', async () => {
